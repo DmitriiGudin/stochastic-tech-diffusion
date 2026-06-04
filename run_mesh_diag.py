@@ -23,6 +23,8 @@ from density_utils import (
     lspv_year_summary,
     lspv_county_year_summary,
     plot_lspv_adoptions_nearest_node,
+    map_transmission_distance_to_nodes,
+    plot_transmission_distance_nodes,
 )
 
 
@@ -67,6 +69,9 @@ def main() -> int:
     parser.add_argument("--verbose", action="store_true")
     
     parser.add_argument("--lspv_csv", default="data/raw/uspvdb_v4_0_20260414.csv", type=str)
+    
+    parser.add_argument("--transmission_shp", default="data/raw/Transmission_Lines/Transmission_Lines.shp", type=str)
+    parser.add_argument("--transmission_buffer_km", default=15.0, type=float, help="How far outside the mesh to keep transmission lines.")
 
     args = parser.parse_args()
 
@@ -90,6 +95,7 @@ def main() -> int:
 
     pop_csv = Path(args.pop_csv)
     lspv_csv = Path(args.lspv_csv)
+    transmission_shp = Path(args.transmission_shp)
 
     if not admin1_shp.exists():
         raise FileNotFoundError(admin1_shp)
@@ -99,6 +105,8 @@ def main() -> int:
         raise FileNotFoundError(pop_csv)
     if not lspv_csv.exists():
         raise FileNotFoundError(lspv_csv)
+    if not transmission_shp.exists():
+        raise FileNotFoundError(transmission_shp)
 
     # Computational mesh output
     mesh_dir = base / "mesh"
@@ -129,6 +137,7 @@ def main() -> int:
     png_pop_compare = fig_dir / f"{tag}_population_compare_{year}.png"
     png_pop_smooth = fig_dir / f"{tag}_population_smoothed_{year}.png"
     png_lspv_adoptions = fig_dir / f"{tag}_lspv_adoptions_nearest_node.png"
+    png_transmission_distance = fig_dir / f"{tag}_transmission_distance_km.png"
 
     cfg = MeshBuildConfig(
         h_km=float(args.h_km),
@@ -174,6 +183,15 @@ def main() -> int:
         smooth_k_neighbors=int(args.smooth_k_neighbors),
         smooth_kernel=str(args.smooth_kernel),
     )
+    
+    transmission_features = map_transmission_distance_to_nodes(
+        msh_path=msh_path,
+        transmission_shp=transmission_shp,
+        epsg_project=cfg.epsg_project,
+        buffer_km=float(args.transmission_buffer_km),
+    )
+    
+    features.update(transmission_features)
 
     save_node_features_npz(
         out_npz=pop_npz,
@@ -216,6 +234,13 @@ def main() -> int:
         msh_path=msh_path,
         node_counts=node_lspv_counts,
         out_png=png_lspv_adoptions,
+        epsg_project=cfg.epsg_project,
+    )
+    
+    plot_transmission_distance_nodes(
+        msh_path=msh_path,
+        distances_km=features["transmission_distance_km"],
+        out_png=png_transmission_distance,
         epsg_project=cfg.epsg_project,
     )
     
@@ -264,6 +289,15 @@ def main() -> int:
             "global": lspv_global_summary,
             "counties": lspv_county_summary,
         },
+        "transmission_lines": {
+            "shapefile": str(transmission_shp),
+            "buffer_km": float(args.transmission_buffer_km),
+            "lines_retained": int(features["transmission_lines_retained"][0]),
+            "nodes_zero_distance": int(features["transmission_nodes_zero_count"][0]),
+            "distance_min_km": float(features["transmission_distance_min_km"][0]),
+            "distance_median_km": float(features["transmission_distance_median_km"][0]),
+            "distance_max_km": float(features["transmission_distance_max_km"][0]),
+        },
     }
 
     with open(meta_path, "w", encoding="utf-8") as f:
@@ -272,6 +306,16 @@ def main() -> int:
     print("[RUN] summary:")
     print(json.dumps(metadata, indent=2))
     print(f"[RUN] wrote metadata: {meta_path}")
+    
+    print("[RUN] transmission-line summary:")
+    print(json.dumps({
+        "buffer_km": float(args.transmission_buffer_km),
+        "lines_retained": int(features["transmission_lines_retained"][0]),
+        "nodes_zero_distance": int(features["transmission_nodes_zero_count"][0]),
+        "distance_min_km": float(features["transmission_distance_min_km"][0]),
+        "distance_median_km": float(features["transmission_distance_median_km"][0]),
+        "distance_max_km": float(features["transmission_distance_max_km"][0]),
+    }, indent=2))
 
     return 0
 

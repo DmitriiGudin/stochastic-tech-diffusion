@@ -5,6 +5,7 @@ from typing import Optional
 
 import numpy as np
 import pandas as pd
+import geopandas as gpd
 import meshio
 import matplotlib.pyplot as plt
 import matplotlib.tri as mtri
@@ -12,8 +13,10 @@ import matplotlib.tri as mtri
 from scipy.spatial import cKDTree
 from pyproj import Transformer
 
-import geopandas as gpd
 from shapely.geometry import Point
+from shapely.geometry import LineString, MultiLineString, GeometryCollection, Polygon
+from shapely.ops import transform as shapely_transform, unary_union
+from shapely.strtree import STRtree
 
 
 # ============================================================
@@ -360,27 +363,359 @@ def plot_lspv_adoptions_nearest_node(
     epsg_project: int,
 ) -> None:
     """
-    Linear-scale plot of number of LSPV adoptions assigned to nearest node.
+    Sparse LSPV plot:
+      - draw the mesh in light grey
+      - draw colored dots only at nodes with at least one adoption
     """
     out_png.parent.mkdir(parents=True, exist_ok=True)
 
-    vmax = float(np.nanmax(node_counts)) if len(node_counts) else 1.0
+    pts_km = load_mesh_points_km(msh_path)
+    tri = load_mesh_triangles(msh_path)
+
+    pts_m = pts_km * 1000.0
+    inv = Transformer.from_crs(f"EPSG:{epsg_project}", "EPSG:4326", always_xy=True)
+    lon, lat = inv.transform(pts_m[:, 0], pts_m[:, 1])
+    lon = np.asarray(lon, dtype=float)
+    lat = np.asarray(lat, dtype=float)
+
+    node_counts = np.asarray(node_counts, dtype=float)
+    nz = node_counts > 0
+
+    fig, ax = plt.subplots(figsize=(9, 7), constrained_layout=True)
+
+    triang = mtri.Triangulation(lon, lat, tri)
+    ax.triplot(triang, linewidth=0.25, color="0.75", alpha=0.65)
+    
+    # Draw outer mesh boundary clearly
+    edge_count = {}
+    for a, b, c in tri:
+        for e in [(a, b), (b, c), (c, a)]:
+            e = tuple(sorted(e))
+            edge_count[e] = edge_count.get(e, 0) + 1
+    
+    boundary_edges = [e for e, count in edge_count.items() if count == 1]
+    
+    for a, b in boundary_edges:
+        ax.plot(
+            [lon[a], lon[b]],
+            [lat[a], lat[b]],
+            color="black",
+            linewidth=1.5,
+            alpha=1.0,
+            zorder=3,
+        )
+
+    if np.any(nz):
+        vmax = max(float(np.nanmax(node_counts[nz])), 1.0)
+        sc = ax.scatter(
+            lon[nz],
+            lat[nz],
+            c=node_counts[nz],
+            s=35,
+            linewidths=0.25,
+            edgecolors="black",
+            vmin=1.0,
+            vmax=vmax,
+        )
+        fig.colorbar(sc, ax=ax, fraction=0.045, pad=0.02, label="Adoptions / node")
+    else:
+        ax.text(
+            0.5,
+            0.5,
+            "No LSPV adoptions inside mesh",
+            transform=ax.transAxes,
+            ha="center",
+            va="center",
+            fontsize=12,
+        )
+
+    ax.set_aspect("equal", adjustable="box")
+    ax.set_xlabel("Longitude")
+    ax.set_ylabel("Latitude")
+    ax.set_title("LSPV adoptions assigned to nearest mesh node")
+
+    fig.savefig(out_png, dpi=200)
+    plt.close(fig)
+
+    print(f"[PLOT] wrote {out_png}")
+    
+    
+# ============================================================
+# Transmission line utilities
+# ============================================================
+
+def _geometry_to_km(geom):
+    """
+    Convert projected-meter shapely geometry to projected-km geometry.
+    """
+    return shapely_transform(lambda x, y, z=None: (np.asarray(x) / 1000.0, np.asarray(y) / 1000.0), geom)
+
+
+def _extract_lines(geom) -> list:
+    """
+    Extract LineString components from arbitrary shapely geometry.
+    """
+    if geom is None or geom.is_empty:
+        return []
+
+    if isinstance(geom, LineString):
+        return [geom]
+
+    if isinstance(geom, MultiLineString):
+        return [g for g in geom.geoms if not g.is_empty]
+
+    if isinstance(geom, GeometryCollection):
+        out = []
+        for g in geom.geoms:
+            out.extend(_extract_lines(g))
+        return out
+
+    return []
+
+
+def _mesh_triangle_polygons_km(msh_path: Path) -> list[Polygon]:
+    pts = load_mesh_points_km(msh_path)
+    tri = load_mesh_triangles(msh_path)
+
+    polys = []
+    for a, b, c in tri:
+        poly = Polygon([
+            tuple(pts[a]),
+            tuple(pts[b]),
+            tuple(pts[c]),
+        ])
+        if poly.is_valid and not poly.is_empty and poly.area > 0:
+            polys.append(poly)
+        else:
+            poly = poly.buffer(0)
+            if poly.is_valid and not poly.is_empty and poly.area > 0:
+                polys.append(poly)
+
+    return polys
+
+
+def _load_transmission_lines_km_near_mesh(
+    *,
+    transmission_shp: Path,
+    msh_path: Path,
+    epsg_project: int,
+    buffer_km: float,
+) -> list:
+    """
+    Load transmission lines, project to EPSG coordinates, convert meters to km,
+    and retain only lines intersecting a buffered mesh domain.
+    """
+    if not transmission_shp.exists():
+        raise FileNotFoundError(transmission_shp)
+
+    gdf = gpd.read_file(transmission_shp)
+    if gdf.empty:
+        return []
+
+    gdf = gdf.to_crs(f"EPSG:{epsg_project}")
+
+    lines = []
+    for geom in gdf.geometry.values:
+        geom_km = _geometry_to_km(geom)
+        lines.extend(_extract_lines(geom_km))
+
+    if not lines:
+        return []
+
+    # Build mesh domain polygon from triangles, then buffer outward.
+    tri_polys = _mesh_triangle_polygons_km(msh_path)
+    if not tri_polys:
+        return []
+
+    domain = unary_union(tri_polys)
+    domain_buffered = domain.buffer(float(buffer_km))
+
+    # Fast bbox prefilter before exact intersection.
+    minx, miny, maxx, maxy = domain_buffered.bounds
+    retained = []
+    for line in lines:
+        lx0, ly0, lx1, ly1 = line.bounds
+        if lx1 < minx or lx0 > maxx or ly1 < miny or ly0 > maxy:
+            continue
+        if line.intersects(domain_buffered):
+            retained.append(line)
+
+    return retained
+
+
+def _strtree_query(tree: STRtree, geom):
+    """
+    Compatibility wrapper for Shapely 1.x and 2.x.
+
+    Shapely 1.x STRtree.query returns geometries.
+    Shapely 2.x STRtree.query returns integer indices.
+    """
+    out = tree.query(geom)
+    return out
+
+
+def _tree_items_from_query(query_result, geoms: list):
+    if len(query_result) == 0:
+        return []
+
+    first = query_result[0]
+    if isinstance(first, (int, np.integer)):
+        return [geoms[int(i)] for i in query_result]
+
+    return list(query_result)
+
+
+def _nearest_line_distance_km(point, tree: STRtree, lines: list) -> float:
+    """
+    Compatibility wrapper for nearest-distance queries.
+    """
+    nearest = tree.nearest(point)
+
+    # Shapely 2.x returns index; Shapely 1.x returns geometry.
+    if isinstance(nearest, (int, np.integer)):
+        line = lines[int(nearest)]
+    else:
+        line = nearest
+
+    return float(point.distance(line))
+
+
+def map_transmission_distance_to_nodes(
+    *,
+    msh_path: Path,
+    transmission_shp: Path,
+    epsg_project: int,
+    buffer_km: float = 15.0,
+) -> dict:
+    """
+    Compute nodewise distance to nearest transmission line.
+
+    Rule:
+      - if any transmission segment intersects one of the triangles incident
+        to a node, that node receives distance 0;
+      - otherwise distance is Euclidean distance in projected km coordinates
+        to nearest retained transmission-line segment.
+
+    Lines are retained if they intersect the mesh domain buffered by buffer_km.
+    """
+    pts = load_mesh_points_km(msh_path)
+    tri = load_mesh_triangles(msh_path)
+    n_nodes = pts.shape[0]
+
+    lines = _load_transmission_lines_km_near_mesh(
+        transmission_shp=transmission_shp,
+        msh_path=msh_path,
+        epsg_project=epsg_project,
+        buffer_km=buffer_km,
+    )
+
+    distances = np.full(n_nodes, np.nan, dtype=float)
+
+    if not lines:
+        return {
+            "transmission_distance_km": distances,
+            "transmission_lines_retained": np.array([0], dtype=int),
+            "transmission_buffer_km": np.array([float(buffer_km)]),
+            "transmission_nodes_zero_count": np.array([0], dtype=int),
+            "transmission_distance_min_km": np.array([np.nan]),
+            "transmission_distance_median_km": np.array([np.nan]),
+            "transmission_distance_max_km": np.array([np.nan]),
+        }
+
+    tree = STRtree(lines)
+
+    # ------------------------------------------------------------
+    # Step 1: zero-distance rule from triangle intersections.
+    # ------------------------------------------------------------
+    zero_nodes = np.zeros(n_nodes, dtype=bool)
+
+    for a, b, c in tri:
+        poly = Polygon([tuple(pts[a]), tuple(pts[b]), tuple(pts[c])])
+        if not poly.is_valid or poly.is_empty or poly.area <= 0:
+            continue
+
+        hits_raw = _strtree_query(tree, poly)
+        hits = _tree_items_from_query(hits_raw, lines)
+
+        for line in hits:
+            if line.intersects(poly):
+                zero_nodes[[a, b, c]] = True
+                break
+
+    distances[zero_nodes] = 0.0
+
+    # ------------------------------------------------------------
+    # Step 2: nearest distance for all remaining nodes.
+    # ------------------------------------------------------------
+    remaining = np.flatnonzero(~zero_nodes)
+
+    for i in remaining:
+        p = Point(float(pts[i, 0]), float(pts[i, 1]))
+        distances[i] = _nearest_line_distance_km(p, tree, lines)
+
+    finite = distances[np.isfinite(distances)]
+
+    return {
+        "transmission_distance_km": distances,
+        "transmission_lines_retained": np.array([len(lines)], dtype=int),
+        "transmission_buffer_km": np.array([float(buffer_km)]),
+        "transmission_nodes_zero_count": np.array([int(np.count_nonzero(zero_nodes))], dtype=int),
+        "transmission_distance_min_km": np.array([float(np.nanmin(finite)) if finite.size else np.nan]),
+        "transmission_distance_median_km": np.array([float(np.nanmedian(finite)) if finite.size else np.nan]),
+        "transmission_distance_max_km": np.array([float(np.nanmax(finite)) if finite.size else np.nan]),
+    }
+
+
+def plot_transmission_distance_nodes(
+    *,
+    msh_path: Path,
+    distances_km: np.ndarray,
+    out_png: Path,
+    epsg_project: int,
+) -> None:
+    """
+    Diagnostic plot of nodewise distance to nearest transmission line.
+    Uses log1p scale because distances can have long tails.
+    """
+    out_png.parent.mkdir(parents=True, exist_ok=True)
+
+    pts_km = load_mesh_points_km(msh_path)
+    tri = load_mesh_triangles(msh_path)
+
+    pts_m = pts_km * 1000.0
+    inv = Transformer.from_crs(f"EPSG:{epsg_project}", "EPSG:4326", always_xy=True)
+    lon, lat = inv.transform(pts_m[:, 0], pts_m[:, 1])
+    lon = np.asarray(lon, dtype=float)
+    lat = np.asarray(lat, dtype=float)
+
+    vals = np.asarray(distances_km, dtype=float)
+    plot_vals = np.log1p(np.clip(vals, 0.0, None))
+
+    vmax = float(np.nanquantile(plot_vals, 0.99)) if plot_vals.size else 1.0
     vmax = max(vmax, 1.0)
 
     fig, ax = plt.subplots(figsize=(9, 7), constrained_layout=True)
 
-    sc = _node_circle_plot(
-        msh_path=msh_path,
-        values=node_counts,
-        ax=ax,
-        epsg_project=epsg_project,
-        title="LSPV adoptions / nearest mesh node",
+    triang = mtri.Triangulation(lon, lat, tri)
+    ax.triplot(triang, linewidth=0.2, color="0.8", alpha=0.6)
+
+    sc = ax.scatter(
+        lon,
+        lat,
+        c=plot_vals,
+        s=max(6.0, 5000.0 / max(np.sqrt(len(vals)), 1.0)) * 0.35,
+        linewidths=0.0,
         vmin=0.0,
         vmax=vmax,
-        transform="linear",
     )
 
-    fig.colorbar(sc, ax=ax, fraction=0.045, pad=0.02)
+    fig.colorbar(sc, ax=ax, fraction=0.045, pad=0.02, label="log1p distance to line [km]")
+
+    ax.set_aspect("equal", adjustable="box")
+    ax.set_xlabel("Longitude")
+    ax.set_ylabel("Latitude")
+    ax.set_title("Distance to nearest transmission line")
+
     fig.savefig(out_png, dpi=200)
     plt.close(fig)
 
