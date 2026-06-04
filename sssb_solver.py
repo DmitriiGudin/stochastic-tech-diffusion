@@ -142,20 +142,30 @@ def observed_driven_nll(
         jump = Y_year / n_sub
 
         for _ in range(n_sub):
-            info_effect = I / (1.0 + I)
-            hazard = p + q * info_effect
+            with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
+                info_effect = I / (1.0 + I)
+                hazard = p + q * info_effect
 
-            mu[yi] += R * hazard * dt
+                mu[yi] += R * hazard * dt
 
-            J_plus = J + jump
+                J_plus = J + jump
 
-            I = I + dt * gamma_J * J_plus
+                I_new = I + dt * gamma_J * J_plus
 
-            LJ = L @ J_plus
-            J = J_plus + dt * (-k_J * J_plus + D * LJ + S0)
+                LJ = L @ J_plus
+                J_new = J_plus + dt * (-k_J * J_plus + D * LJ + S0)
 
-            I = np.maximum(I, 0.0)
-            J = np.maximum(J, 0.0)
+            if (
+                not np.all(np.isfinite(mu[yi]))
+                or not np.all(np.isfinite(I_new))
+                or not np.all(np.isfinite(J_new))
+            ):
+                if return_details:
+                    return np.inf, {}
+                return np.inf
+
+            I = np.maximum(I_new, 0.0)
+            J = np.maximum(J_new, 0.0)
 
         W_cum += Y_year
 
