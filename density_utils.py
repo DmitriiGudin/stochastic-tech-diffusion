@@ -720,6 +720,112 @@ def plot_transmission_distance_nodes(
     plt.close(fig)
 
     print(f"[PLOT] wrote {out_png}")
+    
+    
+# ============================================================
+# GIS solar data utilities
+# ============================================================
+
+def map_pvout_to_nodes(
+    *,
+    msh_path: Path,
+    pvout_tif: Path,
+    epsg_project: int,
+) -> dict:
+    """
+    Sample Photovoltaic Electricity Potential raster at mesh nodes.
+
+    Returns
+    -------
+    dict containing:
+        pv_potential : ndarray, shape (n_nodes,)
+    """
+    try:
+        import rasterio
+        from pyproj import Transformer
+    except ImportError as e:
+        raise ImportError(
+            "PVOUT mapping requires rasterio. Install with e.g. "
+            "`conda install -c conda-forge rasterio`."
+        ) from e
+
+    if not pvout_tif.exists():
+        raise FileNotFoundError(pvout_tif)
+
+    pts_km = load_mesh_points_km(msh_path)
+    pts_m = pts_km * 1000.0
+
+    with rasterio.open(pvout_tif) as src:
+        raster_crs = src.crs
+
+        if raster_crs is None:
+            raise ValueError(f"Raster {pvout_tif} has no CRS.")
+
+        transformer = Transformer.from_crs(
+            f"EPSG:{epsg_project}",
+            raster_crs,
+            always_xy=True,
+        )
+
+        xs, ys = transformer.transform(pts_m[:, 0], pts_m[:, 1])
+        coords = list(zip(xs, ys))
+
+        vals = np.array([v[0] for v in src.sample(coords)], dtype=float)
+
+        nodata = src.nodata
+        if nodata is not None:
+            vals[np.isclose(vals, nodata)] = np.nan
+
+    return {
+        "pv_potential": vals,
+        "pv_potential_valid_count": np.array([int(np.count_nonzero(np.isfinite(vals)))]),
+        "pv_potential_min": np.array([float(np.nanmin(vals)) if np.any(np.isfinite(vals)) else np.nan]),
+        "pv_potential_median": np.array([float(np.nanmedian(vals)) if np.any(np.isfinite(vals)) else np.nan]),
+        "pv_potential_max": np.array([float(np.nanmax(vals)) if np.any(np.isfinite(vals)) else np.nan]),
+    }
+
+
+def plot_pv_potential_nodes(
+    *,
+    msh_path: Path,
+    pv_values: np.ndarray,
+    out_png: Path,
+    epsg_project: int,
+) -> None:
+    """
+    Linear-scale diagnostic plot of PV electricity potential sampled at mesh nodes.
+    """
+    out_png.parent.mkdir(parents=True, exist_ok=True)
+
+    vals = np.asarray(pv_values, dtype=float)
+    finite = np.isfinite(vals)
+
+    if np.any(finite):
+        vmin = float(np.nanquantile(vals[finite], 0.01))
+        vmax = float(np.nanquantile(vals[finite], 0.99))
+        if vmax <= vmin:
+            vmax = vmin + 1.0
+    else:
+        vmin, vmax = 0.0, 1.0
+
+    fig, ax = plt.subplots(figsize=(9, 7), constrained_layout=True)
+
+    sc = _node_circle_plot(
+        msh_path=msh_path,
+        values=vals,
+        ax=ax,
+        epsg_project=epsg_project,
+        title="PV electricity potential at mesh nodes",
+        vmin=vmin,
+        vmax=vmax,
+        transform="linear",
+    )
+
+    fig.colorbar(sc, ax=ax, fraction=0.045, pad=0.02, label="Specific yield (kWh/kWp) / yr")
+    fig.savefig(out_png, dpi=200)
+    plt.close(fig)
+
+    print(f"[PLOT] wrote {out_png}")
 
 
 # ============================================================
@@ -1085,7 +1191,7 @@ def plot_population_comparison(
         transform="log1p"
     )
 
-    fig.colorbar(sc1, ax=axes.ravel().tolist(), fraction=0.035, pad=0.02)
+    fig.colorbar(sc1, ax=axes.ravel().tolist(), fraction=0.035, pad=0.02, label="ln(1 + population) / node")
     fig.savefig(out_png, dpi=200)
     plt.close(fig)
 
@@ -1121,7 +1227,7 @@ def plot_population_smoothed(
         transform="log1p"
     )
 
-    fig.colorbar(sc, ax=ax, fraction=0.045, pad=0.02)
+    fig.colorbar(sc, ax=ax, fraction=0.045, pad=0.02, label="ln(1 + population) / node")
     fig.savefig(out_png, dpi=200)
     plt.close(fig)
 

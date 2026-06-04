@@ -25,6 +25,8 @@ from density_utils import (
     plot_lspv_adoptions_nearest_node,
     map_transmission_distance_to_nodes,
     plot_transmission_distance_nodes,
+    map_pvout_to_nodes,
+    plot_pv_potential_nodes,
 )
 
 
@@ -72,6 +74,8 @@ def main() -> int:
     
     parser.add_argument("--transmission_shp", default="data/raw/Transmission_Lines/Transmission_Lines.shp", type=str)
     parser.add_argument("--transmission_buffer_km", default=15.0, type=float, help="How far outside the mesh to keep transmission lines.")
+    
+    parser.add_argument("--pvout_tif", default="data/raw/PVOUT.tif", type=str)
 
     args = parser.parse_args()
 
@@ -96,6 +100,7 @@ def main() -> int:
     pop_csv = Path(args.pop_csv)
     lspv_csv = Path(args.lspv_csv)
     transmission_shp = Path(args.transmission_shp)
+    pvout_tif = Path(args.pvout_tif)
 
     if not admin1_shp.exists():
         raise FileNotFoundError(admin1_shp)
@@ -107,6 +112,8 @@ def main() -> int:
         raise FileNotFoundError(lspv_csv)
     if not transmission_shp.exists():
         raise FileNotFoundError(transmission_shp)
+    if not pvout_tif.exists():
+        raise FileNotFoundError(pvout_tif)
 
     # Computational mesh output
     mesh_dir = base / "mesh"
@@ -138,6 +145,7 @@ def main() -> int:
     png_pop_smooth = fig_dir / f"{tag}_population_smoothed_{year}.png"
     png_lspv_adoptions = fig_dir / f"{tag}_lspv_adoptions_nearest_node.png"
     png_transmission_distance = fig_dir / f"{tag}_transmission_distance_km.png"
+    png_pv_potential = fig_dir / f"{tag}_pv_potential.png"
 
     cfg = MeshBuildConfig(
         h_km=float(args.h_km),
@@ -190,8 +198,14 @@ def main() -> int:
         epsg_project=cfg.epsg_project,
         buffer_km=float(args.transmission_buffer_km),
     )
-    
     features.update(transmission_features)
+    
+    pv_features = map_pvout_to_nodes(
+        msh_path=msh_path,
+        pvout_tif=pvout_tif,
+        epsg_project=cfg.epsg_project,
+    )
+    features.update(pv_features)
 
     save_node_features_npz(
         out_npz=pop_npz,
@@ -252,6 +266,13 @@ def main() -> int:
         state_codes=states,
         county_names=counties,
     )
+    
+    plot_pv_potential_nodes(
+        msh_path=msh_path,
+        pv_values=features["pv_potential"],
+        out_png=png_pv_potential,
+        epsg_project=cfg.epsg_project,
+    )
 
     # ------------------------------------------------------------
     # 4. Metadata
@@ -297,6 +318,13 @@ def main() -> int:
             "distance_min_km": float(features["transmission_distance_min_km"][0]),
             "distance_median_km": float(features["transmission_distance_median_km"][0]),
             "distance_max_km": float(features["transmission_distance_max_km"][0]),
+        },
+        "pvout": {
+            "tif": str(pvout_tif),
+            "valid_count": int(features["pv_potential_valid_count"][0]),
+            "min": float(features["pv_potential_min"][0]),
+            "median": float(features["pv_potential_median"][0]),
+            "max": float(features["pv_potential_max"][0]),
         },
     }
 
