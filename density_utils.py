@@ -361,6 +361,7 @@ def plot_lspv_adoptions_nearest_node(
     node_counts: np.ndarray,
     out_png: Path,
     epsg_project: int,
+    scale: str = "linear"
 ) -> None:
     """
     Sparse LSPV plot:
@@ -404,20 +405,32 @@ def plot_lspv_adoptions_nearest_node(
             alpha=1.0,
             zorder=3,
         )
+        
+    if scale == "linear":
+        plot_counts = node_counts
+        colorbar_label = "Adoptions / node"
+        vmin = 1.0
+        vmax = max(float(np.nanmax(node_counts[nz])), 1.0) if np.any(nz) else 1.0
+    elif scale == "log1p":
+        plot_counts = np.log1p(node_counts)
+        colorbar_label = "ln(1 + adoptions / node)"
+        vmin = np.log1p(1.0)
+        vmax = max(float(np.nanmax(plot_counts[nz])), np.log1p(1.0)) if np.any(nz) else 1.0
+    else:
+        raise ValueError("scale must be 'linear' or 'log1p'.")
 
     if np.any(nz):
-        vmax = max(float(np.nanmax(node_counts[nz])), 1.0)
         sc = ax.scatter(
             lon[nz],
             lat[nz],
-            c=node_counts[nz],
+            c=plot_counts[nz],
             s=35,
             linewidths=0.25,
             edgecolors="black",
-            vmin=1.0,
+            vmin=vmin,
             vmax=vmax,
         )
-        fig.colorbar(sc, ax=ax, fraction=0.045, pad=0.02, label="Adoptions / node")
+        fig.colorbar(sc, ax=ax, fraction=0.045, pad=0.02, label=colorbar_label)
     else:
         ax.text(
             0.5,
@@ -1106,44 +1119,90 @@ def _node_circle_plot(
     vmin: Optional[float] = None,
     vmax: Optional[float] = None,
     transform: str = "linear",
+    n_layers: int = 10,
 ):
     lon, lat = mesh_points_lonlat(msh_path, epsg_project=epsg_project)
 
-    values = np.asarray(values, dtype=float)
+    raw_values = np.asarray(values, dtype=float)
 
     if transform == "log1p":
-        plot_values = np.log1p(np.clip(values, 0.0, None))
+        plot_values = np.log1p(np.clip(raw_values, 0.0, None))
     elif transform == "linear":
-        plot_values = values
+        plot_values = raw_values
     else:
         raise ValueError("transform must be 'linear' or 'log1p'.")
 
+    finite = np.isfinite(plot_values)
+
     if vmin is None:
-        vmin = float(np.nanmin(plot_values))
+        vmin = float(np.nanmin(plot_values[finite])) if np.any(finite) else 0.0
     if vmax is None:
-        vmax = float(np.nanmax(plot_values))
+        vmax = float(np.nanmax(plot_values[finite])) if np.any(finite) else 1.0
     if vmax <= vmin:
         vmax = vmin + 1.0
 
-    n = len(values)
+    n = len(raw_values)
     s = max(6.0, 5000.0 / max(np.sqrt(n), 1.0)) * float(radius_scale)
 
-    sc = ax.scatter(
-        lon,
-        lat,
-        c=plot_values,
-        s=s,
-        linewidths=0.0,
-        vmin=vmin,
-        vmax=vmax,
-    )
+    finite_vals = plot_values[finite]
+    if finite_vals.size == 0:
+        layer_edges = np.array([vmin, vmax])
+    else:
+        qs = np.linspace(0.0, 1.0, int(n_layers) + 1)
+        layer_edges = np.nanquantile(finite_vals, qs)
+        layer_edges = np.unique(layer_edges)
+        if layer_edges.size < 2:
+            layer_edges = np.array([vmin, vmax])
+
+    mappable = None
+
+    for ell in range(layer_edges.size - 1):
+        lo = layer_edges[ell]
+        hi = layer_edges[ell + 1]
+
+        if ell == layer_edges.size - 2:
+            mask = finite & (plot_values >= lo) & (plot_values <= hi)
+        else:
+            mask = finite & (plot_values >= lo) & (plot_values < hi)
+
+        idx = np.flatnonzero(mask)
+        if idx.size == 0:
+            continue
+
+        # Critical fix: sort within each layer from smaller to larger.
+        idx = idx[np.argsort(plot_values[idx])]
+
+        mappable = ax.scatter(
+            lon[idx],
+            lat[idx],
+            c=plot_values[idx],
+            s=s,
+            linewidths=0.0,
+            vmin=vmin,
+            vmax=vmax,
+            alpha=0.55 + 0.45 * (ell + 1) / max(layer_edges.size - 1, 1),
+            zorder=2 + ell,
+        )
+
+    if mappable is None:
+        mappable = ax.scatter(
+            lon,
+            lat,
+            c=np.zeros_like(plot_values),
+            s=s,
+            linewidths=0.0,
+            vmin=vmin,
+            vmax=vmax,
+            alpha=0.55,
+            zorder=2,
+        )
 
     ax.set_aspect("equal", adjustable="box")
     ax.set_xlabel("Longitude")
     ax.set_ylabel("Latitude")
     ax.set_title(title)
 
-    return sc
+    return mappable
 
 
 def plot_population_comparison(

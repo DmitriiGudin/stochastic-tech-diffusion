@@ -76,6 +76,8 @@ def main() -> int:
     parser.add_argument("--transmission_buffer_km", default=15.0, type=float, help="How far outside the mesh to keep transmission lines.")
     
     parser.add_argument("--pvout_tif", default="data/raw/PVOUT.tif", type=str)
+    
+    parser.add_argument("--adoption_plot_scale", default="linear", choices=["linear", "log1p"])
 
     args = parser.parse_args()
 
@@ -249,6 +251,7 @@ def main() -> int:
         node_counts=node_lspv_counts,
         out_png=png_lspv_adoptions,
         epsg_project=cfg.epsg_project,
+        scale=args.adoption_plot_scale,
     )
     
     plot_transmission_distance_nodes(

@@ -29,6 +29,7 @@ DEFAULT = {
         "smooth_kernel": "gaussian",
         "transmission_buffer_km": 15,
         "plot_pop_year": 2020,
+        "adoption_plot_scale": "linear",  # "linear" or "log1p"
     },
 
     "fit": {
@@ -43,15 +44,15 @@ DEFAULT = {
     },
 
     "param_bounds": {
-        "p": [1e-8, 1e-1],
-        "q": [1e-8, 1],
-        "gamma_J": [1e-8, 10],
-        "k_J": [1e-4, 0.1],
-        "D": [1, 1000],
+        "p": [1e-18, 1e-1],
+        "q": [1e-13, 1],
+        "gamma_J": [1e-8, 100],
+        "k_J": [1e-6, 10],
+        "D": [1e-5, 1000],
         "S0": [0, 0],
-        "r0": [1e-12, 1e-4],
-        "r1": [1e-12, 1e-4],
-        "r2": [1e-12, 1e-4],
+        "r0": [1e-18, 1],
+        "r1": [1e-18, 1],
+        "r2": [1e-18, 1],
     },
 
     "initial": {
@@ -89,6 +90,29 @@ CONFIGS = {
             "use_covariates": True,
             "fit_S0": False,
             "n_random": 500,
+            "maxiter": 500,
+            "dt_years": 0.05,
+        },
+    },
+    
+    "CA_NV_AZ_UT_config": {
+        "region": {
+            "states": ["CA", "NV", "AZ", "UT"],
+            "counties": [],
+        },
+        "mesh": {
+            "h_km": 8,
+            "simplify_km": 24,
+        },
+        "density": {
+            "smooth_length_km": 75,
+            "smooth_kernel": "gaussian",
+            "transmission_buffer_km": 25,
+        },
+        "fit": {
+            "use_covariates": True,
+            "fit_S0": False,
+            "n_random": 5000, #10000
             "maxiter": 500,
             "dt_years": 0.05,
         },

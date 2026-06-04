@@ -189,9 +189,9 @@ def main() -> int:
         options={
             "maxiter": int(args.maxiter),
             "disp": True,
-            "ftol": 1e-8,
-            "gtol": 1e-5,
-            "maxls": 30,
+            "ftol": 1e-10,
+            "gtol": 1e-8,
+            "maxls": 100,
         },
     )
 

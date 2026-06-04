@@ -134,6 +134,8 @@ def observed_driven_nll(
     W_cum = np.zeros(n_nodes, dtype=float)
 
     mu = np.zeros_like(Y, dtype=float)
+    mu_U = np.zeros_like(Y, dtype=float)
+    mu_V = np.zeros_like(Y, dtype=float)
 
     for yi in range(n_years):
         Y_year = Y[yi]
@@ -144,8 +146,12 @@ def observed_driven_nll(
         for _ in range(n_sub):
             with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
                 info_effect = I / (1.0 + I)
-                hazard = p + q * info_effect
-
+                hazard_U = p
+                hazard_V = q * info_effect
+                hazard = hazard_U + hazard_V
+                
+                mu_U[yi] += R * hazard_U * dt
+                mu_V[yi] += R * hazard_V * dt
                 mu[yi] += R * hazard * dt
 
                 J_plus = J + jump
@@ -189,6 +195,11 @@ def observed_driven_nll(
         "years": years,
         "dt_years_used": np.array([dt]),
         "n_substeps_per_year": np.array([n_sub]),
+        "mu_U": mu_U,
+        "mu_V": mu_V,
+        "cum_mu_U": np.sum(mu_U, axis=0),
+        "cum_mu_V": np.sum(mu_V, axis=0),
+        "cum_mu_total": np.sum(mu, axis=0),
     }
 
     return nll, details

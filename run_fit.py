@@ -256,6 +256,7 @@ def build_mesh_and_features(config_name: str, cfg: dict) -> tuple[Path, Path, di
         node_counts=node_lspv_counts,
         out_png=fig_dir / f"{tag}_lspv_adoptions_nearest_node.png",
         epsg_project=mb_cfg.epsg_project,
+        scale=str(density.get("adoption_plot_scale", "linear")),
     )
 
     plot_transmission_distance_nodes(
