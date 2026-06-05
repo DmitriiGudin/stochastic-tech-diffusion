@@ -17,6 +17,7 @@ class SSSBFitParams:
     r0: float
     r1: float = 0.0
     r2: float = 0.0
+    r_max: float = 1e-4
     FI_a: float = 1.0
     FI_b: float = 1.0
     FI_c: float = 1e6
@@ -28,6 +29,8 @@ class SSSBFitConfig:
     eps_mu: float = 1e-12
     use_covariates: bool = True
     normalize_nll: bool = True
+    capacity_link: str = "logistic"
+    standardize_covariates: bool = True
     
     
 def information_effect(I: np.ndarray, params: SSSBFitParams) -> np.ndarray:
@@ -55,6 +58,34 @@ def softplus(x: np.ndarray) -> np.ndarray:
     return np.logaddexp(0.0, x)
 
 
+def logistic(x: np.ndarray) -> np.ndarray:
+    x = np.asarray(x, dtype=float)
+    out = np.empty_like(x, dtype=float)
+
+    pos = x >= 0
+    out[pos] = 1.0 / (1.0 + np.exp(-x[pos]))
+
+    exp_x = np.exp(x[~pos])
+    out[~pos] = exp_x / (1.0 + exp_x)
+
+    return out
+
+
+def capacity_response(eta: np.ndarray, link: str) -> np.ndarray:
+    link = str(link).lower()
+
+    if link == "logistic":
+        return logistic(eta)
+
+    if link == "softplus":
+        return softplus(eta)
+
+    if link == "linear":
+        return np.maximum(eta, 0.0)
+
+    raise ValueError(f"Unknown capacity link: {link}")
+
+
 def standardize_feature(x: np.ndarray) -> np.ndarray:
     x = np.asarray(x, dtype=float)
     good = np.isfinite(x)
@@ -80,6 +111,8 @@ def build_capacity(
     transmission_distance_km: np.ndarray,
     params: SSSBFitParams,
     use_covariates: bool,
+    capacity_link: str = "logistic",
+    standardize_covariates: bool = True,
 ) -> np.ndarray:
     population = np.asarray(population, dtype=float)
     population = np.clip(population, 0.0, None)
@@ -87,14 +120,30 @@ def build_capacity(
     eta = np.full_like(population, float(params.r0), dtype=float)
 
     if use_covariates:
-        z_pv = standardize_feature(pv_potential)
-        z_grid = standardize_feature(transmission_distance_km)
+        if standardize_covariates:
+            z_pv = standardize_feature(pv_potential)
+            z_grid = standardize_feature(transmission_distance_km)
+        else:
+            z_pv = np.asarray(pv_potential, dtype=float)
+            z_grid = np.asarray(transmission_distance_km, dtype=float)
 
         eta += float(params.r1) * z_pv
         eta -= float(params.r2) * z_grid
 
-    r = softplus(eta)
-    return population * r
+    h = capacity_response(eta, capacity_link)
+
+    if capacity_link in ("logistic",):
+        K = population * float(params.r_max) * h
+
+    elif capacity_link in ("softplus", "linear"):
+        # Backward-compatible / experimental unbounded options.
+        # Not recommended for stable simulations.
+        K = population * h
+
+    else:
+        raise ValueError(f"Unknown capacity link: {capacity_link}")
+
+    return np.clip(K, 0.0, None)
 
 
 def observed_driven_nll(
@@ -132,6 +181,8 @@ def observed_driven_nll(
         transmission_distance_km=transmission_distance_km,
         params=params,
         use_covariates=cfg.use_covariates,
+        capacity_link=cfg.capacity_link,
+        standardize_covariates=cfg.standardize_covariates,
     )
 
     p = float(params.p)
@@ -140,6 +191,8 @@ def observed_driven_nll(
     k_J = float(params.k_J)
     D = float(params.D)
     S0 = float(params.S0)
+    
+    r_max = float(params.r_max)
 
     FI_a = float(params.FI_a)
     FI_b = float(params.FI_b)
@@ -148,6 +201,7 @@ def observed_driven_nll(
     if (
         p < 0 or q < 0 or gamma_J < 0 or k_J < 0 or D < 0 or S0 < 0
         or FI_a <= 0 or FI_b <= 0 or FI_c <= 0
+        or r_max <= 0
     ):
         if return_details:
             return np.inf, {}

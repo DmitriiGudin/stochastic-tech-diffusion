@@ -46,16 +46,22 @@ DEFAULT = {
         "progress_freq": 10,
         "year_window": None,  # e.g. [2007, 2025], inclusive
     },
+    
+    "capacity": {
+        "link": "logistic",          # "logistic" or "linear"
+        "standardize_covariates": True,
+    },
 
     "param_bounds": {
-        "p": [1e-8, 1e-3],
+        "p": [1e-6, 1e-1],
         "q": [1e-5, 1],
         "gamma_J": [1e-3, 1],
         "k_J": [1e-6, 1],
         "D": [1, 1e5],
         "S0": [0, 0],
+        "r_max": [1e-7, 1e-3],
         "r0": [1e-15, 1e-10],
-        "r1": [1e-10, 1e-5],
+        "r1": [1e-8, 1e-4],
         "r2": [1e-15, 1e-10],
         "FI_a": [0.01, 10],
         "FI_b": [0.01, 10],
@@ -69,6 +75,7 @@ DEFAULT = {
         "k_J": 0.01,
         "D": 100,
         "S0": 0,
+        "r_max": 1e-4,
         "r0": 1e-5,
         "r1": 1e-9,
         "r2": 1e-6,
@@ -81,6 +88,8 @@ DEFAULT = {
         "forecast_year": 2050,
         "seed": 2026,
         "fps": 2,
+        "batch_diagnostic_n_sims": 100,
+        "run_batch_diagnostic": True,
     },
 }
 
@@ -106,9 +115,9 @@ CONFIGS = {
             "year_window": [2007, 2025],
             "use_covariates": True,
             "fit_S0": False,
-            "n_random": 10000, #10000
+            "n_random": 500, #10000
             "maxiter": 500,
-            "dt_years": 0.05,
+            "dt_years": 0.1,
         },
     },
 }

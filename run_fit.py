@@ -38,7 +38,7 @@ from density_utils import (
 from fit_data_utils import build_sssb_fit_data
 from sssb_solver import SSSBFitParams, SSSBFitConfig, observed_driven_nll
 
-POSITIVE_PARAMS = {"p", "q", "gamma_J", "k_J", "D", "S0", "FI_a", "FI_b", "FI_c"}
+POSITIVE_PARAMS = {"p", "q", "gamma_J", "k_J", "D", "S0", "FI_a", "FI_b", "FI_c", "r_max"}
 
 
 def fmt_hhmmss(seconds: float) -> str:
@@ -67,7 +67,7 @@ def load_config(name: str) -> dict:
 
 
 def transformed_names(use_covariates: bool, fit_S0: bool) -> list[str]:
-    names = ["p", "q", "gamma_J", "k_J", "D"]
+    names = ["p", "q", "gamma_J", "k_J", "D", "r_max"]
     if fit_S0:
         names.append("S0")
     names.append("r0")
@@ -132,6 +132,7 @@ def unpack_theta(theta: np.ndarray, cfg: dict) -> SSSBFitParams:
         k_J=values["k_J"],
         D=values["D"],
         S0=values.get("S0", 0.0),
+        r_max=values["r_max"],
         r0=values["r0"],
         r1=values.get("r1", 0.0),
         r2=values.get("r2", 0.0),
@@ -350,6 +351,8 @@ def fit_model(config_name: str, cfg: dict, msh_path: Path, features_path: Path) 
         dt_years=float(fit["dt_years"]),
         use_covariates=bool(fit["use_covariates"]),
         normalize_nll=True,
+        capacity_link=str(cfg["capacity"].get("link", "logistic")),
+        standardize_covariates=bool(cfg["capacity"].get("standardize_covariates", True)),
     )
 
     def objective(theta: np.ndarray) -> float:

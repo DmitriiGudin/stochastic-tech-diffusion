@@ -5,6 +5,7 @@ import copy
 import json
 from pathlib import Path
 
+import time
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.tri as mtri
@@ -128,10 +129,12 @@ def simulate_sssb_stochastic(
             rate_V = q * FI * R
             rate_total = rate_U + rate_V
 
-            prob_total = 1.0 - np.exp(-rate_total * dt)
-            prob_total = np.clip(prob_total, 0.0, 1.0)
-
-            d_total = rng.binomial(np.floor(R).astype(int), prob_total)
+            lam = np.maximum(rate_total * dt, 0.0)
+            d_total = rng.poisson(lam)
+            
+            # Hard cap only where capacity is already nearly exhausted.
+            cap_remaining = np.maximum(np.ceil(R).astype(int), 0)
+            d_total = np.minimum(d_total, cap_remaining)
 
             innov_prob = np.ones_like(rate_total, dtype=float)
             np.divide(rate_U, rate_total, out=innov_prob, where=rate_total > 0.0)
@@ -171,6 +174,92 @@ def simulate_sssb_stochastic(
         "V": V,
         "I": I,
         "J": J,
+    }
+
+
+def simulate_sssb_stochastic_batch(
+    *,
+    data,
+    params: SSSBFitParams,
+    solver_cfg: SSSBFitConfig,
+    capacity: np.ndarray,
+    years: np.ndarray,
+    forecast_year: int,
+    seed: int,
+    n_sims: int,
+) -> dict:
+    rng = np.random.default_rng(seed)
+
+    start_year = int(years[0])
+    all_years = np.arange(start_year, int(forecast_year) + 1)
+
+    n_nodes = capacity.size
+    dt = float(solver_cfg.dt_years)
+    n_sub = int(round(1.0 / dt))
+    dt = 1.0 / n_sub
+
+    capacity = np.asarray(capacity, dtype=np.float32)
+    L_T = data.L.T.tocsr()
+
+    U = np.zeros((n_sims, n_nodes), dtype=np.int32)
+    V = np.zeros((n_sims, n_nodes), dtype=np.int32)
+    I = np.zeros((n_sims, n_nodes), dtype=np.float32)
+    J = np.zeros((n_sims, n_nodes), dtype=np.float32)
+
+    cum_hist = np.zeros((n_sims, all_years.size, n_nodes), dtype=np.float32)
+
+    p = float(params.p)
+    q = float(params.q)
+    gamma_J = float(params.gamma_J)
+    k_J = float(params.k_J)
+    D = float(params.D)
+    S0 = float(params.S0)
+
+    for yy, year in enumerate(all_years):
+        for _ in range(n_sub):
+            R = np.maximum(capacity[None, :] - U - V, 0.0)
+
+            FI = information_effect(I, params)
+            rate_U = p * R
+            rate_V = q * FI * R
+            rate_total = rate_U + rate_V
+
+            lam = np.maximum(rate_total * dt, 0.0)
+            d_total = rng.poisson(lam)
+
+            cap_remaining = np.maximum(np.ceil(R).astype(np.int32), 0)
+            d_total = np.minimum(d_total, cap_remaining)
+
+            innov_prob = np.ones_like(rate_total, dtype=np.float32)
+            np.divide(rate_U, rate_total, out=innov_prob, where=rate_total > 0.0)
+            innov_prob = np.clip(innov_prob, 0.0, 1.0)
+
+            dU = rng.binomial(d_total, innov_prob).astype(np.int32)
+            dV = d_total.astype(np.int32) - dU
+
+            U += dU
+            V += dV
+
+            jumps = d_total.astype(np.float32)
+            J_plus = J + jumps
+
+            I_new = I + dt * gamma_J * J_plus
+            LJ = J_plus @ L_T
+            J_new = J_plus + dt * (-k_J * J_plus + D * LJ + S0)
+
+            I = np.maximum(I_new, 0.0).astype(np.float32)
+            J = np.maximum(J_new, 0.0).astype(np.float32)
+
+        cum_hist[:, yy, :] = U + V
+
+    final_totals = cum_hist[:, -1, :].sum(axis=1)
+
+    return {
+        "years": all_years,
+        "cum_hist": cum_hist,
+        "mean_cum": cum_hist.mean(axis=0),
+        "std_cum": cum_hist.std(axis=0),
+        "final_totals": final_totals,
     }
 
 
@@ -438,7 +527,13 @@ def main() -> int:
     print("fitted expected historical total:", float(details["mu"].sum()))
     print("fit years:", int(data.years[0]), "to", int(data.years[-1]))
     print("forecast year:", forecast_year)
+    print("S0:", params.S0)
+    print("capacity sum:", capacity.sum())
+    print("initial annual innovation mean:", (params.p * capacity).sum())
+    
+    sim_times = {}
 
+    t0 = time.perf_counter()
     sssb = simulate_sssb_stochastic(
         data=data,
         params=params,
@@ -448,12 +543,14 @@ def main() -> int:
         forecast_year=forecast_year,
         seed=seed,
     )
+    sim_times["sssb"] = time.perf_counter() - t0
 
     n_nodes = data.Y.shape[1]
     uniform_weights = np.full(n_nodes, 1.0 / n_nodes)
     pop = np.clip(np.asarray(data.population, dtype=float), 0.0, None)
     pop_weights = pop / pop.sum() if pop.sum() > 0 else uniform_weights
 
+    t0 = time.perf_counter()
     bass_uniform = simulate_bass_baseline(
         annual_expected=annual_bass,
         weights=uniform_weights,
@@ -461,6 +558,9 @@ def main() -> int:
         forecast_year=forecast_year,
         seed=seed + 1,
     )
+    sim_times["bass_uniform"] = time.perf_counter() - t0
+    
+    t0 = time.perf_counter()
     bass_population = simulate_bass_baseline(
         annual_expected=annual_bass,
         weights=pop_weights,
@@ -468,6 +568,41 @@ def main() -> int:
         forecast_year=forecast_year,
         seed=seed + 2,
     )
+    sim_times["bass_population"] = time.perf_counter() - t0
+
+    print("[SIM timing]")
+    for name, val in sim_times.items():
+        print(f"  {name}: {val:.4f} sec")
+        
+    if bool(sim_cfg.get("run_batch_diagnostic", True)):
+        n_batch = int(sim_cfg.get("batch_diagnostic_n_sims", 100))
+    
+        t0 = time.perf_counter()
+        batch = simulate_sssb_stochastic_batch(
+            data=data,
+            params=params,
+            solver_cfg=solver_cfg,
+            capacity=capacity,
+            years=data.years,
+            forecast_year=forecast_year,
+            seed=seed + 10_000,
+            n_sims=n_batch,
+        )
+        batch_elapsed = time.perf_counter() - t0
+    
+        final_totals = np.asarray(batch["final_totals"], dtype=float)
+    
+        print("[SIM batch diagnostic]")
+        print(f"  n_sims: {n_batch}")
+        print(f"  total time: {batch_elapsed:.4f} sec")
+        print(f"  time per simulation: {batch_elapsed / max(n_batch, 1):.6f} sec")
+        print(f"  final total mean: {float(np.mean(final_totals)):.3f}")
+        print(f"  final total std:  {float(np.std(final_totals)):.3f}")
+        print(f"  final total min:  {float(np.min(final_totals)):.3f}")
+        print(f"  final total max:  {float(np.max(final_totals)):.3f}")
+        print(f"  final total nonzero fraction: {float(np.mean(final_totals > 0.0)):.3f}")
+        print(f"  fitted expected historical total: {float(details['mu'].sum()):.3f}")
+        print(f"  observed historical total: {float(data.Y.sum()):.3f}")
 
     observed_cum_hist = np.cumsum(data.Y, axis=0)
 
