@@ -38,6 +38,8 @@ from density_utils import (
 from fit_data_utils import build_sssb_fit_data
 from sssb_solver import SSSBFitParams, SSSBFitConfig, observed_driven_nll
 
+POSITIVE_PARAMS = {"p", "q", "gamma_J", "k_J", "D", "S0", "FI_a", "FI_b", "FI_c"}
+
 
 def fmt_hhmmss(seconds: float) -> str:
     s = int(seconds)
@@ -71,17 +73,19 @@ def transformed_names(use_covariates: bool, fit_S0: bool) -> list[str]:
     names.append("r0")
     if use_covariates:
         names.extend(["r1", "r2"])
+
+    names.extend(["FI_a", "FI_b", "FI_c"])
     return names
 
 
 def param_to_theta_value(name: str, value: float) -> float:
-    if name in {"p", "q", "gamma_J", "k_J", "D", "S0"}:
+    if name in POSITIVE_PARAMS:
         return float(np.log(value))
     return float(value)
 
 
 def theta_to_param_value(name: str, value: float) -> float:
-    if name in {"p", "q", "gamma_J", "k_J", "D", "S0"}:
+    if name in POSITIVE_PARAMS:
         return float(np.exp(value))
     return float(value)
 
@@ -131,6 +135,9 @@ def unpack_theta(theta: np.ndarray, cfg: dict) -> SSSBFitParams:
         r0=values["r0"],
         r1=values.get("r1", 0.0),
         r2=values.get("r2", 0.0),
+        FI_a=values["FI_a"],
+        FI_b=values["FI_b"],
+        FI_c=values["FI_c"],
     )
 
 
@@ -336,6 +343,7 @@ def fit_model(config_name: str, cfg: dict, msh_path: Path, features_path: Path) 
         lspv_csv=Path(paths["lspv_csv"]),
         epsg_project=int(cfg["mesh"]["epsg_project"]),
         population_key=str(fit["population_key"]),
+        year_window=fit.get("year_window", None),
     )
 
     solver_cfg = SSSBFitConfig(
@@ -436,6 +444,7 @@ def fit_model(config_name: str, cfg: dict, msh_path: Path, features_path: Path) 
         "success": bool(res.success),
         "message": str(res.message),
         "fun": float(res.fun),
+        "year_window": fit.get("year_window", None),
         "nll_recomputed": float(nll),
         "theta_unconstrained": res.x.tolist(),
         "theta_bounds": bounds,

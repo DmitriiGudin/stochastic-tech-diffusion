@@ -8,9 +8,9 @@ from pathlib import Path
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.tri as mtri
-from matplotlib.colors import Normalize
 
 from scipy.optimize import minimize
+from scipy.sparse import identity
 from pyproj import Transformer
 
 from configs import DEFAULT, CONFIGS
@@ -109,8 +109,18 @@ def plot_node_values(
         vals = np.log1p(np.clip(raw_vals, 0.0, None))
     elif scale == "linear":
         vals = np.clip(raw_vals, 0.0, None)
+    elif scale == "custom_log":
+        positive = raw_vals[raw_vals > 0.0]
+        if positive.size == 0:
+            vals = np.zeros_like(raw_vals, dtype=float)
+        else:
+            # vmin/vmax are passed in already-transformed log units.
+            # For safety, if vmin is unavailable, use max - 8.
+            max_val = float(np.nanmax(positive))
+            floor_log = np.log(max_val) - 8.0 if vmin is None else float(vmin)
+            vals = np.log(np.maximum(raw_vals, np.exp(floor_log)))
     else:
-        raise ValueError("scale must be 'linear' or 'log1p'.")
+        raise ValueError("scale must be 'linear', 'log1p', or 'custom_log'.")
 
     finite = np.isfinite(vals)
 
@@ -122,7 +132,7 @@ def plot_node_values(
         vmax = vmin + 1.0
 
     triang = mtri.Triangulation(lon, lat, tri)
-    ax.triplot(triang, linewidth=0.2, color="0.82", alpha=0.65, zorder=1)
+    ax.triplot(triang, linewidth=0.25, color="0.82", alpha=0.55, zorder=1)
 
     s = max(5.0, 5000.0 / max(np.sqrt(len(vals)), 1.0)) * 0.35
 
@@ -159,6 +169,7 @@ def plot_node_values(
             lat[idx],
             c=vals[idx],
             s=s,
+            cmap='hot',
             linewidths=0.0,
             vmin=vmin,
             vmax=vmax,
@@ -172,6 +183,7 @@ def plot_node_values(
             lat,
             c=np.zeros_like(vals),
             s=s,
+            cmap='hot',
             linewidths=0.0,
             vmin=vmin,
             vmax=vmax,
@@ -232,6 +244,169 @@ def observed_monthly_curve(Y: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     return t, cum
 
 
+def monthly_rate_curve_from_annual_counts(annual_counts: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Converts annual counts into monthly adoption rates by assuming
+    uniform adoption within each year.
+
+    Returns
+    -------
+    t_month : ndarray
+        Monthly time grid in years, length n_years * 12.
+    rate_month : ndarray
+        Monthly adoption rate in adoptions/year.
+        Since annual counts are spread uniformly, each month in year y
+        has rate equal to annual_counts[y].
+    """
+    annual_counts = np.asarray(annual_counts, dtype=float)
+    rate_month = np.repeat(annual_counts, 12)
+    t_month = (np.arange(rate_month.size, dtype=float) + 0.5) / 12.0
+    return t_month, rate_month
+
+
+def graph_edge_lengths_km(data) -> np.ndarray:
+    pts = data.mesh_points_km
+    tri = data.triangles
+
+    edges = set()
+    for a, b, c in tri:
+        for i, j in ((a, b), (b, c), (c, a)):
+            edges.add(tuple(sorted((int(i), int(j)))))
+
+    if not edges:
+        return np.array([], dtype=float)
+
+    lengths = []
+    for i, j in edges:
+        lengths.append(float(np.linalg.norm(pts[i] - pts[j])))
+
+    return np.asarray(lengths, dtype=float)
+
+
+def adjacency_from_laplacian(L):
+    """
+    Convert normalized graph Laplacian into unweighted adjacency.
+    Off-diagonal nonzeros correspond to graph edges.
+    """
+    A = L.copy().tocsr()
+    A.setdiag(0.0)
+    A.eliminate_zeros()
+    A.data[:] = 1.0
+    return A
+
+
+def graph_neighborhood_matrix(L, level: int):
+    """
+    Boolean sparse matrix B_level where B[i,j]=1 if node j is within
+    graph distance <= level from node i.
+
+    level=0 means node itself only.
+    level=1 means node + adjacent nodes.
+    """
+    n = L.shape[0]
+    A = adjacency_from_laplacian(L)
+    B = identity(n, format="csr", dtype=float)
+
+    frontier = identity(n, format="csr", dtype=float)
+    for _ in range(level):
+        frontier = frontier @ A
+        frontier.data[:] = 1.0
+        B = B + frontier
+        B.data[:] = 1.0
+        B.eliminate_zeros()
+
+    B.data[:] = 1.0
+    return B.tocsr()
+
+
+def neighborhood_aggregate_counts(X: np.ndarray, B) -> np.ndarray:
+    """
+    Aggregate node-year counts over graph neighborhoods.
+
+    X shape: (n_years, n_nodes)
+    B shape: (n_nodes, n_nodes), where B[i,j]=1 if j is in i-neighborhood.
+
+    Returns A[y,i] = sum_{j in neighborhood(i)} X[y,j].
+    """
+    X = np.asarray(X, dtype=float)
+    return (B @ X.T).T
+
+
+def neighborhood_spatial_metrics(
+    *,
+    Y_obs: np.ndarray,
+    predictions: dict[str, np.ndarray],
+    L,
+    data,
+    max_level: int = 3,
+) -> dict:
+    """
+    Metrics after aggregating counts over graph neighborhoods.
+
+    level=0: original nodewise metrics.
+    level=1: node + immediate neighbors.
+    level=2: node + neighbors + neighbors-of-neighbors.
+    etc.
+    """
+    out = {}
+
+    edge_lengths = graph_edge_lengths_km(data)
+    median_edge_km = float(np.nanmedian(edge_lengths)) if edge_lengths.size else np.nan
+
+    for level in range(max_level + 1):
+        B = graph_neighborhood_matrix(L, level)
+        Y_smooth = neighborhood_aggregate_counts(Y_obs, B)
+        Y_cum_smooth = np.cumsum(Y_smooth, axis=0)
+
+        obs_total_by_node = Y_smooth.sum(axis=0)
+        nonzero_mask = obs_total_by_node > 0
+
+        approx_radius_km = (
+            float(level * median_edge_km)
+            if np.isfinite(median_edge_km)
+            else None
+        )
+
+        level_key = f"level_{level}"
+
+        out[level_key] = {
+            "graph_level": int(level),
+            "approx_radius_km": approx_radius_km,
+            "median_edge_length_km": median_edge_km,
+            "models": {},
+        }
+
+        for model_name, pred in predictions.items():
+            pred_smooth = neighborhood_aggregate_counts(pred, B)
+            pred_cum_smooth = np.cumsum(pred_smooth, axis=0)
+
+            out[level_key]["models"][model_name] = {
+                "instantaneous": metric_bundle(
+                    Y_smooth.ravel(),
+                    pred_smooth.ravel(),
+                ),
+                "cumulative": metric_bundle(
+                    Y_cum_smooth.ravel(),
+                    pred_cum_smooth.ravel(),
+                ),
+            }
+
+            if np.any(nonzero_mask):
+                out[level_key]["models"][model_name]["instantaneous_nonzero"] = metric_bundle(
+                    Y_smooth[:, nonzero_mask].ravel(),
+                    pred_smooth[:, nonzero_mask].ravel(),
+                )
+                out[level_key]["models"][model_name]["cumulative_nonzero"] = metric_bundle(
+                    Y_cum_smooth[:, nonzero_mask].ravel(),
+                    pred_cum_smooth[:, nonzero_mask].ravel(),
+                )
+            else:
+                out[level_key]["models"][model_name]["instantaneous_nonzero"] = None
+                out[level_key]["models"][model_name]["cumulative_nonzero"] = None
+
+    return out
+
+
 def yearly_rmse_counts(obs: np.ndarray, pred: np.ndarray) -> float:
     return float(np.sqrt(np.mean((obs - pred) ** 2)))
 
@@ -248,6 +423,203 @@ def yearly_rmse_log1p_cumulative(obs: np.ndarray, pred: np.ndarray) -> float:
     obs_cum = np.cumsum(obs)
     pred_cum = np.cumsum(pred)
     return float(np.sqrt(np.mean((np.log1p(obs_cum) - np.log1p(pred_cum)) ** 2)))
+
+
+def mae_counts(obs: np.ndarray, pred: np.ndarray) -> float:
+    return float(np.mean(np.abs(obs - pred)))
+
+
+def rmse_counts(obs: np.ndarray, pred: np.ndarray) -> float:
+    return float(np.sqrt(np.mean((obs - pred) ** 2)))
+
+
+def mae_log1p_counts(obs: np.ndarray, pred: np.ndarray) -> float:
+    return float(np.mean(np.abs(np.log1p(obs) - np.log1p(pred))))
+
+
+def rmse_log1p_counts(obs: np.ndarray, pred: np.ndarray) -> float:
+    return float(np.sqrt(np.mean((np.log1p(obs) - np.log1p(pred)) ** 2)))
+
+
+def topk_hit_concentration(
+    *,
+    obs_node_total: np.ndarray,
+    pred_node_score: np.ndarray,
+    ks: tuple[float, ...] = (0.01, 0.05, 0.10, 0.20),
+) -> dict:
+    """
+    Fraction of observed adoptions captured by top-k fraction of nodes ranked by prediction.
+
+    obs_node_total:
+        Observed cumulative adoptions per node.
+
+    pred_node_score:
+        Predicted cumulative mean adoptions per node.
+
+    ks:
+        Fractions of nodes to include, e.g. 0.05 = top 5%.
+    """
+    obs = np.asarray(obs_node_total, dtype=float)
+    pred = np.asarray(pred_node_score, dtype=float)
+
+    n = obs.size
+    total_obs = float(obs.sum())
+
+    if n == 0 or total_obs <= 0:
+        return {f"top_{int(100*k)}pct": None for k in ks}
+
+    order = np.argsort(-pred)
+
+    out = {}
+    for k in ks:
+        m = max(1, int(np.ceil(k * n)))
+        chosen = order[:m]
+        captured = float(obs[chosen].sum())
+        out[f"top_{int(round(100*k))}pct"] = {
+            "node_fraction": float(k),
+            "n_nodes": int(m),
+            "observed_captured": captured,
+            "observed_total": total_obs,
+            "capture_fraction": captured / total_obs,
+        }
+
+    return out
+
+
+def calibration_by_risk_bin(
+    *,
+    obs_node_total: np.ndarray,
+    pred_node_total: np.ndarray,
+    n_bins: int = 10,
+) -> dict:
+    """
+    Bin nodes by predicted cumulative mean count and compare observed vs predicted totals.
+
+    Returns one entry per risk bin.
+    """
+    obs = np.asarray(obs_node_total, dtype=float)
+    pred = np.asarray(pred_node_total, dtype=float)
+
+    finite = np.isfinite(pred) & np.isfinite(obs)
+    obs = obs[finite]
+    pred = pred[finite]
+
+    if obs.size == 0:
+        return {}
+
+    # Sort by predicted risk.
+    order = np.argsort(pred)
+    obs = obs[order]
+    pred = pred[order]
+
+    bins = np.array_split(np.arange(obs.size), n_bins)
+
+    out = {}
+    for b, idx in enumerate(bins, start=1):
+        if idx.size == 0:
+            continue
+
+        obs_sum = float(obs[idx].sum())
+        pred_sum = float(pred[idx].sum())
+
+        out[f"bin_{b:02d}"] = {
+            "n_nodes": int(idx.size),
+            "pred_min": float(pred[idx].min()),
+            "pred_max": float(pred[idx].max()),
+            "pred_mean": float(pred[idx].mean()),
+            "obs_total": obs_sum,
+            "pred_total": pred_sum,
+            "obs_minus_pred": obs_sum - pred_sum,
+            "obs_over_pred": float(obs_sum / pred_sum) if pred_sum > 0 else None,
+        }
+
+    return out
+
+
+def metric_bundle(obs: np.ndarray, pred: np.ndarray) -> dict:
+    return {
+        "RMSE": rmse_counts(obs, pred),
+        "MAE": mae_counts(obs, pred),
+        "RMSE_log1p": rmse_log1p_counts(obs, pred),
+        "MAE_log1p": mae_log1p_counts(obs, pred),
+    }
+
+
+def make_bass_node_baselines(
+    *,
+    annual_bass: np.ndarray,      # (n_years,)
+    population: np.ndarray,       # (n_nodes,)
+    n_nodes: int,
+) -> dict[str, np.ndarray]:
+    """
+    Returns annual node-level predicted counts for two spatially naive Bass baselines.
+
+    uniform:
+        annual_bass[y] / n_nodes
+
+    population:
+        annual_bass[y] * population_i / sum_i population_i
+    """
+    annual_bass = np.asarray(annual_bass, dtype=float)
+    population = np.asarray(population, dtype=float)
+    population = np.clip(population, 0.0, None)
+
+    uniform_weights = np.full(n_nodes, 1.0 / max(n_nodes, 1), dtype=float)
+
+    if population.sum() > 0:
+        pop_weights = population / population.sum()
+    else:
+        pop_weights = uniform_weights.copy()
+
+    return {
+        "bass_uniform": annual_bass[:, None] * uniform_weights[None, :],
+        "bass_population": annual_bass[:, None] * pop_weights[None, :],
+    }
+
+
+def nodewise_spatial_metrics(
+    *,
+    Y_obs: np.ndarray,                  # (n_years, n_nodes)
+    predictions: dict[str, np.ndarray], # same shape
+) -> dict:
+    """
+    Computes nodewise instantaneous and cumulative metrics.
+
+    Two domains:
+      all nodes
+      nonzero nodes: nodes with total observed adoption > 0
+    """
+    Y_obs = np.asarray(Y_obs, dtype=float)
+    obs_cum = np.cumsum(Y_obs, axis=0)
+
+    total_obs_by_node = Y_obs.sum(axis=0)
+    nonzero_mask = total_obs_by_node > 0
+
+    out = {}
+
+    for name, pred in predictions.items():
+        pred = np.asarray(pred, dtype=float)
+        pred_cum = np.cumsum(pred, axis=0)
+
+        out[name] = {
+            "instantaneous": metric_bundle(Y_obs.ravel(), pred.ravel()),
+            "cumulative": metric_bundle(obs_cum.ravel(), pred_cum.ravel()),
+        }
+
+        if np.any(nonzero_mask):
+            out[name]["instantaneous_nonzero"] = metric_bundle(
+                Y_obs[:, nonzero_mask].ravel(),
+                pred[:, nonzero_mask].ravel(),
+            )
+            out[name]["cumulative_nonzero"] = metric_bundle(
+                obs_cum[:, nonzero_mask].ravel(),
+                pred_cum[:, nonzero_mask].ravel(),
+            )
+        else:
+            out[name]["instantaneous_nonzero"] = None
+            out[name]["cumulative_nonzero"] = None
+
+    return out
 
 
 def main() -> int:
@@ -275,6 +647,7 @@ def main() -> int:
         lspv_csv=lspv_csv,
         epsg_project=int(cfg_named["mesh"]["epsg_project"]),
         population_key=str(cfg_named["fit"]["population_key"]),
+        year_window=cfg_named["fit"].get("year_window", None),
     )
 
     params = SSSBFitParams(**fit_payload["params"])
@@ -315,6 +688,40 @@ def main() -> int:
     bass_cum_year_start = np.concatenate([[0.0], bass_cum_year_end[:-1]])
     annual_bass = bass_cum_year_end - bass_cum_year_start
     
+    t_rate_obs, rate_obs = monthly_rate_curve_from_annual_counts(annual_obs)
+    t_rate_model, rate_model = monthly_rate_curve_from_annual_counts(annual_model)
+    t_rate_bass, rate_bass = monthly_rate_curve_from_annual_counts(annual_bass)
+    
+    calendar_rate_months = data.years[0] + t_rate_obs
+    
+    bass_node_baselines = make_bass_node_baselines(annual_bass=annual_bass, population=data.population, n_nodes=data.Y.shape[1])
+    
+    node_predictions = {"sssb": details["mu"], **bass_node_baselines,}
+    
+    obs_node_total = data.Y.sum(axis=0)
+    
+    ranking_metrics = {}
+    calibration_metrics = {}
+    
+    for model_name, pred_yi in node_predictions.items():
+        pred_node_total = np.asarray(pred_yi, dtype=float).sum(axis=0)
+    
+        ranking_metrics[model_name] = topk_hit_concentration(
+            obs_node_total=obs_node_total,
+            pred_node_score=pred_node_total,
+            ks=(0.01, 0.05, 0.10, 0.20),
+        )
+    
+        calibration_metrics[model_name] = calibration_by_risk_bin(
+            obs_node_total=obs_node_total,
+            pred_node_total=pred_node_total,
+            n_bins=10,
+        )
+    
+    spatial_node_metrics = nodewise_spatial_metrics(Y_obs=data.Y, predictions=node_predictions)
+    
+    neighborhood_metrics = neighborhood_spatial_metrics(Y_obs=data.Y, predictions=node_predictions, L=data.L, data=data, max_level=3)
+    
     deviance_sssb = poisson_deviance(annual_obs, annual_model)
     deviance_bass = poisson_deviance(annual_obs, annual_bass)
     
@@ -326,6 +733,16 @@ def main() -> int:
     
     rmse_yearly_log1p_bass = yearly_rmse_log1p_counts(annual_obs, annual_bass)
     rmse_cum_log1p_bass = yearly_rmse_log1p_cumulative(annual_obs, annual_bass)
+    
+    mae_yearly = mae_counts(annual_obs, annual_model)
+    mae_cum = mae_counts(np.cumsum(annual_obs), np.cumsum(annual_model))
+    mae_yearly_log1p = mae_log1p_counts(annual_obs, annual_model)
+    mae_cum_log1p = mae_log1p_counts(np.cumsum(annual_obs), np.cumsum(annual_model))
+    
+    mae_yearly_bass = mae_counts(annual_obs, annual_bass)
+    mae_cum_bass = mae_counts(np.cumsum(annual_obs), np.cumsum(annual_bass))
+    mae_yearly_log1p_bass = mae_log1p_counts(annual_obs, annual_bass)
+    mae_cum_log1p_bass = mae_log1p_counts(np.cumsum(annual_obs), np.cumsum(annual_bass))
 
     out_dir = Path("out") / args.config / "metrics"
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -409,26 +826,85 @@ def main() -> int:
     
     adoption_scale = str(cfg_named["density"].get("adoption_plot_scale", "log1p"))
     
-    if adoption_scale == "log1p":
-        actual_vals_for_scale = np.log1p(actual_cum_node)
-        pred_vals_for_scale = np.log1p(pred_cum_node)
-        actual_cbar_label = "ln(1 + observed cumulative count)"
-        pred_cbar_label = "ln(1 + predicted cumulative mean)"
-    else:
+    if adoption_scale == "linear":
+        actual_scale = "linear"
+        pred_scale = "linear"
         actual_vals_for_scale = actual_cum_node
         pred_vals_for_scale = pred_cum_node
         actual_cbar_label = "Observed cumulative count"
         pred_cbar_label = "Predicted cumulative mean"
+        shared_cbar_label = "Cumulative count"
     
-    actual_vmin = 0.0
-    actual_vmax = float(np.nanquantile(actual_vals_for_scale, 0.99))
-    if actual_vmax <= actual_vmin:
-        actual_vmax = 1.0
+    elif adoption_scale == "log1p":
+        actual_scale = "log1p"
+        pred_scale = "log1p"
+        actual_vals_for_scale = np.log1p(actual_cum_node)
+        pred_vals_for_scale = np.log1p(pred_cum_node)
+        actual_cbar_label = "ln(1 + observed cumulative count)"
+        pred_cbar_label = "ln(1 + predicted cumulative mean)"
+        shared_cbar_label = "ln(1 + cumulative count)"
     
-    pred_vmin = 0.0
-    pred_vmax = float(np.nanquantile(pred_vals_for_scale, 0.99))
-    if pred_vmax <= pred_vmin:
-        pred_vmax = 1.0
+    elif adoption_scale == "mixed":
+        actual_scale = "linear"
+        pred_scale = "custom_log"
+    
+        actual_vals_for_scale = actual_cum_node
+    
+        mixed_log_range = float(cfg_named["density"].get("mixed_log_range", 8.0))
+        vmax_pred = float(np.nanmax(pred_cum_node))
+    
+        if vmax_pred <= 0:
+            pred_floor = -mixed_log_range
+            pred_vals_for_scale = np.zeros_like(pred_cum_node)
+        else:
+            pred_floor = np.log(vmax_pred) - mixed_log_range
+            pred_vals_for_scale = np.log(
+                np.maximum(pred_cum_node, np.exp(pred_floor))
+            )
+    
+        actual_cbar_label = "Observed cumulative count"
+        pred_cbar_label = "ln(predicted cumulative mean count)"
+        shared_cbar_label = None
+    
+    else:
+        raise ValueError("adoption_plot_scale must be 'linear', 'log1p', or 'mixed'.")
+        
+    shared_colorbar = bool(cfg_named["density"].get("adoption_shared_colorbar", False))
+    if adoption_scale == "mixed":
+        shared_colorbar = False
+    
+    plot_q = float(cfg_named["density"].get("adoption_plot_quantile", 1.0))
+    plot_q = min(max(plot_q, 0.0), 1.0)
+    
+    if shared_colorbar:
+        combined_vals_for_scale = np.concatenate([
+            np.asarray(actual_vals_for_scale, dtype=float).ravel(),
+            np.asarray(pred_vals_for_scale, dtype=float).ravel(),
+        ])
+    
+        shared_vmin = 0.0
+        shared_vmax = float(np.nanquantile(combined_vals_for_scale, plot_q))
+        if shared_vmax <= shared_vmin:
+            shared_vmax = 1.0
+    
+        actual_vmin = pred_vmin = shared_vmin
+        actual_vmax = pred_vmax = shared_vmax
+    
+    else:
+        actual_vmin = 0.0
+        actual_vmax = float(np.nanquantile(actual_vals_for_scale, plot_q))
+        if actual_vmax <= actual_vmin:
+            actual_vmax = 1.0
+    
+        if adoption_scale == "mixed":
+            pred_vmin = float(np.nanmin(pred_vals_for_scale))
+            pred_vmax = float(np.nanmax(pred_vals_for_scale))
+        else:
+            pred_vmin = 0.0
+            pred_vmax = float(np.nanquantile(pred_vals_for_scale, plot_q))
+    
+        if pred_vmax <= pred_vmin:
+            pred_vmax = pred_vmin + 1.0
     
     fig, axes = plt.subplots(1, 2, figsize=(14, 6), constrained_layout=True)
     
@@ -440,15 +916,7 @@ def main() -> int:
         epsg_project=int(cfg_named["mesh"]["epsg_project"]),
         vmin=actual_vmin,
         vmax=actual_vmax,
-        scale=adoption_scale,
-    )
-    
-    fig.colorbar(
-        sc0,
-        ax=axes[0],
-        fraction=0.045,
-        pad=0.02,
-        label=actual_cbar_label,
+        scale=actual_scale,
     )
     
     sc1 = plot_node_values(
@@ -459,19 +927,68 @@ def main() -> int:
         epsg_project=int(cfg_named["mesh"]["epsg_project"]),
         vmin=pred_vmin,
         vmax=pred_vmax,
-        scale=adoption_scale,
+        scale=pred_scale,
     )
     
-    fig.colorbar(
-        sc1,
-        ax=axes[1],
-        fraction=0.045,
-        pad=0.02,
-        label=pred_cbar_label,
-    )
+    if shared_colorbar:
+        fig.colorbar(
+            sc1,
+            ax=axes.ravel().tolist(),
+            fraction=0.035,
+            pad=0.02,
+            label=actual_cbar_label if actual_cbar_label == pred_cbar_label else "Cumulative count",
+        )
+    else:
+        fig.colorbar(
+            sc0,
+            ax=axes[0],
+            fraction=0.045,
+            pad=0.02,
+            label=actual_cbar_label,
+        )
     
-    fig_path_spatial = out_dir / "observed_vs_predicted_cumulative_log1p.png"
+        fig.colorbar(
+            sc1,
+            ax=axes[1],
+            fraction=0.045,
+            pad=0.02,
+            label=pred_cbar_label,
+        )
+    
+    fig_path_spatial = out_dir / f"observed_vs_predicted_cumulative_{adoption_scale}.png"
     fig.savefig(fig_path_spatial, dpi=200)
+    plt.close(fig)
+    
+    fig, ax = plt.subplots(figsize=(10, 6), constrained_layout=True)
+
+    ax.plot(calendar_rate_months, rate_obs, label="Observed data")
+    ax.plot(calendar_rate_months, rate_bass, label="Classic Bass fit")
+    ax.plot(calendar_rate_months, rate_model, label="SSSB expected rate")
+    
+    ax.set_xlabel("Year")
+    ax.set_ylabel("Adoption rate, adoptions/year")
+    ax.set_title("Adoption rate curve")
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+    
+    fig_path_rate = out_dir / "adoption_rate_curve.png"
+    fig.savefig(fig_path_rate, dpi=200)
+    plt.close(fig)
+    
+    fig, ax = plt.subplots(figsize=(10, 6), constrained_layout=True)
+
+    ax.plot(calendar_rate_months, np.log1p(rate_obs), label="Observed data")
+    ax.plot(calendar_rate_months, np.log1p(rate_bass), label="Classic Bass fit")
+    ax.plot(calendar_rate_months, np.log1p(rate_model), label="SSSB expected rate")
+    
+    ax.set_xlabel("Year")
+    ax.set_ylabel("ln(1 + adoption rate)")
+    ax.set_title("Adoption rate curve, log1p scale")
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+    
+    fig_path_rate_log = out_dir / "adoption_rate_curve_log1p.png"
+    fig.savefig(fig_path_rate_log, dpi=200)
     plt.close(fig)
     
     metrics = {
@@ -481,23 +998,37 @@ def main() -> int:
         "years": data.years.astype(int).tolist(),
         "observed_total": float(annual_obs.sum()),
         "model_expected_total": float(annual_model.sum()),
-        "rmse_yearly_counts": {
-            "sssb": rmse_yearly,
-            "bass": rmse_yearly_bass,
+        "aggregate_metrics": {
+            "yearly_counts": {
+                "sssb": {
+                    "RMSE": rmse_yearly,
+                    "MAE": mae_yearly,
+                    "RMSE_log1p": rmse_yearly_log1p,
+                    "MAE_log1p": mae_yearly_log1p,
+                },
+                "bass": {
+                    "RMSE": rmse_yearly_bass,
+                    "MAE": mae_yearly_bass,
+                    "RMSE_log1p": rmse_yearly_log1p_bass,
+                    "MAE_log1p": mae_yearly_log1p_bass,
+                },
+            },
+            "cumulative_counts": {
+                "sssb": {
+                    "RMSE": rmse_cum,
+                    "MAE": mae_cum,
+                    "RMSE_log1p": rmse_cum_log1p,
+                    "MAE_log1p": mae_cum_log1p,
+                },
+                "bass": {
+                    "RMSE": rmse_cum_bass,
+                    "MAE": mae_cum_bass,
+                    "RMSE_log1p": rmse_cum_log1p_bass,
+                    "MAE_log1p": mae_cum_log1p_bass,
+                },
+            },
         },
-        "rmse_cumulative_counts": {
-            "sssb": rmse_cum,
-            "bass": rmse_cum_bass,
-        },
-        "rmse_yearly_log1p_counts": {
-            "sssb": rmse_yearly_log1p,
-            "bass": rmse_yearly_log1p_bass,
-        },
-        "rmse_cumulative_log1p_counts": {
-            "sssb": rmse_cum_log1p,
-            "bass": rmse_cum_log1p_bass,
-        },
-        "bass": bass,
+        "nodewise_spatial_metrics": spatial_node_metrics,
         "poisson_deviance": {
             "sssb": deviance_sssb,
             "bass": deviance_bass,
@@ -507,7 +1038,12 @@ def main() -> int:
             "cumulative_log1p": str(fig_path_log),
             "final_fields_log1p": str(fig_path_fields),
             "observed_vs_predicted_spatial_log1p": str(fig_path_spatial),
+            "adoption_rate_linear": str(fig_path_rate),
+            "adoption_rate_log1p": str(fig_path_rate_log),
         },
+        "topk_hit_concentration": ranking_metrics,
+        "calibration_by_risk_bin": calibration_metrics,
+        "neighborhood_spatial_metrics": neighborhood_metrics,
     }
 
     metrics_path = out_dir / "metrics.json"

@@ -136,6 +136,30 @@ def _events_inside_mesh_mask(
     return inside, xy_km
 
 
+def apply_year_window(
+    Y: np.ndarray,
+    years: np.ndarray,
+    year_window,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Restrict annual count matrix to inclusive year window [start, end].
+
+    year_window may be None or [start, end].
+    """
+    if year_window is None:
+        return Y, years
+
+    if len(year_window) != 2:
+        raise ValueError("year_window must be None or [start_year, end_year].")
+
+    start, end = int(year_window[0]), int(year_window[1])
+    if start > end:
+        raise ValueError("year_window start must be <= end.")
+
+    mask = (years >= start) & (years <= end)
+    return Y[mask], years[mask]
+
+
 def build_annual_node_count_matrix(
     *,
     msh_path: Path,
@@ -197,6 +221,7 @@ def build_sssb_fit_data(
     lspv_csv: Path,
     epsg_project: int = 5070,
     population_key: str = "population_smooth_2020",
+    year_window=None,
 ) -> SSSBFitData:
     """
     Build all fixed arrays needed for SSSB likelihood optimization.
@@ -206,6 +231,7 @@ def build_sssb_fit_data(
         lspv_csv=lspv_csv,
         epsg_project=epsg_project,
     )
+    Y, years = apply_year_window(Y, years, year_window)
 
     n_nodes = mesh_points_km.shape[0]
     features = load_node_features(node_features_npz)

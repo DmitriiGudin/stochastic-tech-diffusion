@@ -17,6 +17,9 @@ class SSSBFitParams:
     r0: float
     r1: float = 0.0
     r2: float = 0.0
+    FI_a: float = 1.0
+    FI_b: float = 1.0
+    FI_c: float = 1e6
 
 
 @dataclass(frozen=True)
@@ -25,6 +28,27 @@ class SSSBFitConfig:
     eps_mu: float = 1e-12
     use_covariates: bool = True
     normalize_nll: bool = True
+    
+    
+def information_effect(I: np.ndarray, params: SSSBFitParams) -> np.ndarray:
+    """
+    F_I(I) = [I / (1 + a I)]^b * (1 - exp(-c I)).
+    """
+    I = np.maximum(np.asarray(I, dtype=float), 0.0)
+
+    a = float(params.FI_a)
+    b = float(params.FI_b)
+    c = float(params.FI_c)
+
+    if a <= 0 or b <= 0 or c <= 0:
+        return np.full_like(I, np.nan)
+
+    base = I / (1.0 + a * I)
+
+    with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
+        out = np.power(base, b) * (-np.expm1(-c * I))
+
+    return np.maximum(out, 0.0)
 
 
 def softplus(x: np.ndarray) -> np.ndarray:
@@ -117,7 +141,14 @@ def observed_driven_nll(
     D = float(params.D)
     S0 = float(params.S0)
 
-    if p < 0 or q < 0 or gamma_J < 0 or k_J < 0 or D < 0 or S0 < 0:
+    FI_a = float(params.FI_a)
+    FI_b = float(params.FI_b)
+    FI_c = float(params.FI_c)
+    
+    if (
+        p < 0 or q < 0 or gamma_J < 0 or k_J < 0 or D < 0 or S0 < 0
+        or FI_a <= 0 or FI_b <= 0 or FI_c <= 0
+    ):
         if return_details:
             return np.inf, {}
         return np.inf
@@ -145,7 +176,7 @@ def observed_driven_nll(
 
         for _ in range(n_sub):
             with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
-                info_effect = I / (1.0 + I)
+                info_effect = information_effect(I, params)
                 hazard_U = p
                 hazard_V = q * info_effect
                 hazard = hazard_U + hazard_V
