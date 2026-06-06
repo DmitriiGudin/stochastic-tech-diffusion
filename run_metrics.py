@@ -491,49 +491,103 @@ def calibration_by_risk_bin(
     obs_node_total: np.ndarray,
     pred_node_total: np.ndarray,
     n_bins: int = 10,
+    nonfinite_policy: str = "error",  # "error" or "zero"
 ) -> dict:
     """
     Bin nodes by predicted cumulative mean count and compare observed vs predicted totals.
 
-    Returns one entry per risk bin.
+    The bin totals should add up to the post-seed observed and predicted totals
+    unless non-finite predictions are present and nonfinite_policy="zero" is used.
+
+    nonfinite_policy:
+        "error": raise if obs/pred contain non-finite values.
+        "zero": replace non-finite predictions with 0 and keep all nodes.
     """
     obs = np.asarray(obs_node_total, dtype=float)
     pred = np.asarray(pred_node_total, dtype=float)
 
-    finite = np.isfinite(pred) & np.isfinite(obs)
-    obs = obs[finite]
-    pred = pred[finite]
+    if obs.shape != pred.shape:
+        raise ValueError(f"obs and pred must have same shape, got {obs.shape} vs {pred.shape}")
+
+    n_nodes_input = int(obs.size)
+    obs_total_input = float(np.nansum(obs))
+    pred_total_input = float(np.nansum(pred))
+
+    finite_obs = np.isfinite(obs)
+    finite_pred = np.isfinite(pred)
+
+    if not np.all(finite_obs):
+        bad = int(np.sum(~finite_obs))
+        raise ValueError(f"obs_node_total contains {bad} non-finite entries.")
+
+    if not np.all(finite_pred):
+        bad = int(np.sum(~finite_pred))
+        if nonfinite_policy == "error":
+            raise ValueError(
+                f"pred_node_total contains {bad} non-finite entries. "
+                "This usually means the SSSB expected-count solver produced NaN/inf values."
+            )
+        if nonfinite_policy == "zero":
+            pred = np.where(finite_pred, pred, 0.0)
+        else:
+            raise ValueError("nonfinite_policy must be 'error' or 'zero'.")
 
     if obs.size == 0:
-        return {}
+        return {
+            "summary": {
+                "n_nodes_input": n_nodes_input,
+                "obs_total_input": obs_total_input,
+                "pred_total_input": pred_total_input,
+                "obs_total_binned": 0.0,
+                "pred_total_binned": 0.0,
+            },
+            "bins": {},
+        }
 
     # Sort by predicted risk.
     order = np.argsort(pred)
-    obs = obs[order]
-    pred = pred[order]
+    obs_sorted = obs[order]
+    pred_sorted = pred[order]
 
-    bins = np.array_split(np.arange(obs.size), n_bins)
+    bins = np.array_split(np.arange(obs_sorted.size), n_bins)
 
-    out = {}
+    out_bins = {}
+    obs_total_binned = 0.0
+    pred_total_binned = 0.0
+
     for b, idx in enumerate(bins, start=1):
         if idx.size == 0:
             continue
 
-        obs_sum = float(obs[idx].sum())
-        pred_sum = float(pred[idx].sum())
+        obs_sum = float(obs_sorted[idx].sum())
+        pred_sum = float(pred_sorted[idx].sum())
 
-        out[f"bin_{b:02d}"] = {
+        obs_total_binned += obs_sum
+        pred_total_binned += pred_sum
+
+        out_bins[f"bin_{b:02d}"] = {
             "n_nodes": int(idx.size),
-            "pred_min": float(pred[idx].min()),
-            "pred_max": float(pred[idx].max()),
-            "pred_mean": float(pred[idx].mean()),
+            "pred_min": float(pred_sorted[idx].min()),
+            "pred_max": float(pred_sorted[idx].max()),
+            "pred_mean": float(pred_sorted[idx].mean()),
             "obs_total": obs_sum,
             "pred_total": pred_sum,
             "obs_minus_pred": obs_sum - pred_sum,
             "obs_over_pred": float(obs_sum / pred_sum) if pred_sum > 0 else None,
         }
 
-    return out
+    return {
+        "summary": {
+            "n_nodes_input": n_nodes_input,
+            "obs_total_input": obs_total_input,
+            "pred_total_input": pred_total_input,
+            "obs_total_binned": float(obs_total_binned),
+            "pred_total_binned": float(pred_total_binned),
+            "obs_binning_error": float(obs_total_binned - obs_total_input),
+            "pred_binning_error": float(pred_total_binned - pred_total_input),
+        },
+        "bins": out_bins,
+    }
 
 
 def metric_bundle(obs: np.ndarray, pred: np.ndarray) -> dict:
@@ -575,6 +629,35 @@ def make_bass_node_baselines(
         "bass_uniform": annual_bass[:, None] * uniform_weights[None, :],
         "bass_population": annual_bass[:, None] * pop_weights[None, :],
     }
+
+
+def condition_node_predictions_on_seed(
+    *,
+    predictions: dict[str, np.ndarray],
+    Y_obs: np.ndarray,
+    years: np.ndarray,
+    seed_year: int,
+) -> tuple[dict[str, np.ndarray], int]:
+    """
+    Overwrite predicted annual node counts through seed_year, inclusive,
+    with observed annual node counts.
+
+    This makes deterministic expected-count comparisons fair with
+    seed-conditioned simulations.
+    """
+    matches = np.where(years == int(seed_year))[0]
+    if matches.size == 0:
+        raise ValueError(f"seed_year={seed_year} not found in years.")
+
+    seed_idx = int(matches[0])
+
+    out = {}
+    for name, pred in predictions.items():
+        arr = np.asarray(pred, dtype=float).copy()
+        arr[: seed_idx + 1, :] = np.asarray(Y_obs[: seed_idx + 1, :], dtype=float)
+        out[name] = arr
+
+    return out, seed_idx
 
 
 def nodewise_spatial_metrics(
@@ -668,15 +751,7 @@ def main() -> int:
     annual_obs = data.Y.sum(axis=1)
     annual_model = details["mu"].sum(axis=1)
 
-    rmse_yearly = yearly_rmse_counts(annual_obs, annual_model)
-    rmse_cum = yearly_rmse_cumulative(annual_obs, annual_model)
-
     t_obs_month, cum_obs_month = observed_monthly_curve(data.Y)
-    t_model_month, cum_model_month = model_monthly_expected_counts(
-        data=data,
-        params=params,
-        cfg=solver_cfg,
-    )
 
     # Bass fit to monthly cumulative observed curve.
     bass = fit_bass_curve(t_obs_month, cum_obs_month)
@@ -689,60 +764,163 @@ def main() -> int:
     annual_bass = bass_cum_year_end - bass_cum_year_start
     
     t_rate_obs, rate_obs = monthly_rate_curve_from_annual_counts(annual_obs)
-    t_rate_model, rate_model = monthly_rate_curve_from_annual_counts(annual_model)
-    t_rate_bass, rate_bass = monthly_rate_curve_from_annual_counts(annual_bass)
-    
     calendar_rate_months = data.years[0] + t_rate_obs
     
-    bass_node_baselines = make_bass_node_baselines(annual_bass=annual_bass, population=data.population, n_nodes=data.Y.shape[1])
+    bass_node_baselines = make_bass_node_baselines(
+        annual_bass=annual_bass,
+        population=data.population,
+        n_nodes=data.Y.shape[1],
+    )
     
-    node_predictions = {"sssb": details["mu"], **bass_node_baselines,}
+    node_predictions_raw = {
+        "sssb": details["mu"],
+        **bass_node_baselines,
+    }
     
-    obs_node_total = data.Y.sum(axis=0)
+    if getattr(solver_cfg, "condition_on_seed_year", False):
+        node_predictions, seed_idx = condition_node_predictions_on_seed(
+            predictions=node_predictions_raw,
+            Y_obs=data.Y,
+            years=data.years,
+            seed_year=int(solver_cfg.seed_year),
+        )
+        eval_start = seed_idx + 1
+    else:
+        node_predictions = node_predictions_raw
+        seed_idx = -1
+        eval_start = 0
+    
+    if eval_start >= data.Y.shape[0]:
+        raise ValueError(
+            f"No post-seed years available: seed_year={solver_cfg.seed_year}, "
+            f"observed years={data.years[0]}-{data.years[-1]}."
+        )
+    
+    # Post-seed arrays: use these for instantaneous/yearly-new metrics.
+    Y_eval = data.Y[eval_start:, :]
+    node_predictions_eval = {
+        name: pred[eval_start:, :]
+        for name, pred in node_predictions.items()
+    }
+    
+    annual_obs_eval = annual_obs[eval_start:]
+    annual_model_eval = annual_model[eval_start:]
+    annual_bass_eval = annual_bass[eval_start:]
+    
+    # Full-window arrays: use these for cumulative spatial metrics.
+    # node_predictions has already been seed-conditioned, so all models match
+    # observed annual node counts through seed_year.
+    obs_node_total_cum = data.Y.sum(axis=0)
     
     ranking_metrics = {}
     calibration_metrics = {}
     
-    for model_name, pred_yi in node_predictions.items():
-        pred_node_total = np.asarray(pred_yi, dtype=float).sum(axis=0)
+    for model_name, pred_yi_full in node_predictions.items():
+        pred_node_total_cum = np.asarray(pred_yi_full, dtype=float).sum(axis=0)
     
         ranking_metrics[model_name] = topk_hit_concentration(
-            obs_node_total=obs_node_total,
-            pred_node_score=pred_node_total,
+            obs_node_total=obs_node_total_cum,
+            pred_node_score=pred_node_total_cum,
             ks=(0.01, 0.05, 0.10, 0.20),
         )
     
         calibration_metrics[model_name] = calibration_by_risk_bin(
-            obs_node_total=obs_node_total,
-            pred_node_total=pred_node_total,
+            obs_node_total=obs_node_total_cum,
+            pred_node_total=pred_node_total_cum,
             n_bins=10,
         )
+        
+    annual_model_conditioned = np.asarray(node_predictions["sssb"], dtype=float).sum(axis=1)
+    annual_bass_uniform_conditioned = np.asarray(node_predictions["bass_uniform"], dtype=float).sum(axis=1)
+    annual_bass_conditioned = annual_bass_uniform_conditioned
     
-    spatial_node_metrics = nodewise_spatial_metrics(Y_obs=data.Y, predictions=node_predictions)
+    # Seed-conditioned curves for plotting cumulative totals and adoption rates.
+    # These match the convention used by cumulative metrics:
+    #   - observed annual node counts through seed_year;
+    #   - model-predicted annual counts after seed_year.
+    monthly_model_conditioned = np.repeat(annual_model_conditioned / 12.0, 12)
+    cum_model_month = np.concatenate([[0.0], np.cumsum(monthly_model_conditioned)])
     
-    neighborhood_metrics = neighborhood_spatial_metrics(Y_obs=data.Y, predictions=node_predictions, L=data.L, data=data, max_level=3)
+    monthly_bass_conditioned = np.repeat(annual_bass_conditioned / 12.0, 12)
+    cum_bass_conditioned = np.concatenate([[0.0], np.cumsum(monthly_bass_conditioned)])
     
-    deviance_sssb = poisson_deviance(annual_obs, annual_model)
-    deviance_bass = poisson_deviance(annual_obs, annual_bass)
+    _, rate_model = monthly_rate_curve_from_annual_counts(annual_model_conditioned)
+    _, rate_bass = monthly_rate_curve_from_annual_counts(annual_bass_conditioned)
     
-    rmse_yearly_log1p = yearly_rmse_log1p_counts(annual_obs, annual_model)
-    rmse_cum_log1p = yearly_rmse_log1p_cumulative(annual_obs, annual_model)
+    rmse_yearly = yearly_rmse_counts(annual_obs_eval, annual_model_eval)
+    rmse_yearly_log1p = yearly_rmse_log1p_counts(annual_obs_eval, annual_model_eval)
+    mae_yearly = mae_counts(annual_obs_eval, annual_model_eval)
+    mae_yearly_log1p = mae_log1p_counts(annual_obs_eval, annual_model_eval)
     
-    rmse_yearly_bass = yearly_rmse_counts(annual_obs, annual_bass)
-    rmse_cum_bass = yearly_rmse_cumulative(annual_obs, annual_bass)
+    rmse_yearly_bass = yearly_rmse_counts(annual_obs_eval, annual_bass_eval)
+    rmse_yearly_log1p_bass = yearly_rmse_log1p_counts(annual_obs_eval, annual_bass_eval)
+    mae_yearly_bass = mae_counts(annual_obs_eval, annual_bass_eval)
+    mae_yearly_log1p_bass = mae_log1p_counts(annual_obs_eval, annual_bass_eval)
     
-    rmse_yearly_log1p_bass = yearly_rmse_log1p_counts(annual_obs, annual_bass)
-    rmse_cum_log1p_bass = yearly_rmse_log1p_cumulative(annual_obs, annual_bass)
+    rmse_cum = yearly_rmse_cumulative(annual_obs, annual_model_conditioned)
+    rmse_cum_log1p = yearly_rmse_log1p_cumulative(annual_obs, annual_model_conditioned)
+    mae_cum = mae_counts(np.cumsum(annual_obs), np.cumsum(annual_model_conditioned))
+    mae_cum_log1p = mae_log1p_counts(np.cumsum(annual_obs), np.cumsum(annual_model_conditioned))
     
-    mae_yearly = mae_counts(annual_obs, annual_model)
-    mae_cum = mae_counts(np.cumsum(annual_obs), np.cumsum(annual_model))
-    mae_yearly_log1p = mae_log1p_counts(annual_obs, annual_model)
-    mae_cum_log1p = mae_log1p_counts(np.cumsum(annual_obs), np.cumsum(annual_model))
+    rmse_cum_bass = yearly_rmse_cumulative(annual_obs, annual_bass_conditioned)
+    rmse_cum_log1p_bass = yearly_rmse_log1p_cumulative(annual_obs, annual_bass_conditioned)
+    mae_cum_bass = mae_counts(np.cumsum(annual_obs), np.cumsum(annual_bass_conditioned))
+    mae_cum_log1p_bass = mae_log1p_counts(np.cumsum(annual_obs), np.cumsum(annual_bass_conditioned))
     
-    mae_yearly_bass = mae_counts(annual_obs, annual_bass)
-    mae_cum_bass = mae_counts(np.cumsum(annual_obs), np.cumsum(annual_bass))
-    mae_yearly_log1p_bass = mae_log1p_counts(annual_obs, annual_bass)
-    mae_cum_log1p_bass = mae_log1p_counts(np.cumsum(annual_obs), np.cumsum(annual_bass))
+    deviance_sssb = poisson_deviance(annual_obs_eval, annual_model_eval)
+    deviance_bass = poisson_deviance(annual_obs_eval, annual_bass_eval)
+    
+    spatial_node_metrics_instantaneous = nodewise_spatial_metrics(
+        Y_obs=Y_eval,
+        predictions=node_predictions_eval,
+    )
+    
+    spatial_node_metrics_cumulative_full = nodewise_spatial_metrics(
+        Y_obs=data.Y,
+        predictions=node_predictions,
+    )
+    
+    spatial_node_metrics = {}
+    
+    for model_name in node_predictions:
+        spatial_node_metrics[model_name] = {
+            "instantaneous": spatial_node_metrics_instantaneous[model_name]["instantaneous"],
+            "instantaneous_nonzero": spatial_node_metrics_instantaneous[model_name]["instantaneous_nonzero"],
+            "cumulative": spatial_node_metrics_cumulative_full[model_name]["cumulative"],
+            "cumulative_nonzero": spatial_node_metrics_cumulative_full[model_name]["cumulative_nonzero"],
+        }
+        
+    neighborhood_metrics_instantaneous = neighborhood_spatial_metrics(
+        Y_obs=Y_eval,
+        predictions=node_predictions_eval,
+        L=data.L,
+        data=data,
+        max_level=3,
+    )
+    
+    neighborhood_metrics_cumulative_full = neighborhood_spatial_metrics(
+        Y_obs=data.Y,
+        predictions=node_predictions,
+        L=data.L,
+        data=data,
+        max_level=3,
+    )
+    
+    neighborhood_metrics = {}
+    
+    for level_key in neighborhood_metrics_cumulative_full:
+        neighborhood_metrics[level_key] = {
+            **neighborhood_metrics_cumulative_full[level_key],
+            "models": {},
+        }
+    
+        for model_name in node_predictions:
+            neighborhood_metrics[level_key]["models"][model_name] = {
+                "instantaneous": neighborhood_metrics_instantaneous[level_key]["models"][model_name]["instantaneous"],
+                "instantaneous_nonzero": neighborhood_metrics_instantaneous[level_key]["models"][model_name]["instantaneous_nonzero"],
+                "cumulative": neighborhood_metrics_cumulative_full[level_key]["models"][model_name]["cumulative"],
+                "cumulative_nonzero": neighborhood_metrics_cumulative_full[level_key]["models"][model_name]["cumulative_nonzero"],
+            }
 
     out_dir = Path("out") / args.config / "metrics"
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -752,8 +930,8 @@ def main() -> int:
     calendar_months = data.years[0] + t_obs_month
 
     ax.plot(calendar_months, cum_obs_month, label="Observed data")
-    ax.plot(calendar_months, cum_bass, label="Classic Bass fit")
-    ax.plot(calendar_months, cum_model_month, label="SSSB expected cumulative")
+    ax.plot(calendar_months, cum_bass_conditioned, label="Classic Bass fit, seed-conditioned")
+    ax.plot(calendar_months, cum_model_month, label="SSSB expected cumulative, seed-conditioned")
 
     ax.set_xlabel("Year")
     ax.set_ylabel("Cumulative LSPV adoptions")
@@ -768,8 +946,8 @@ def main() -> int:
     fig, ax = plt.subplots(figsize=(10, 6), constrained_layout=True)
 
     ax.plot(calendar_months, np.log1p(cum_obs_month), label="Observed data")
-    ax.plot(calendar_months, np.log1p(cum_bass), label="Classic Bass fit")
-    ax.plot(calendar_months, np.log1p(cum_model_month), label="SSSB expected cumulative")
+    ax.plot(calendar_months, np.log1p(cum_bass_conditioned), label="Classic Bass fit, seed-conditioned")
+    ax.plot(calendar_months, np.log1p(cum_model_month), label="SSSB expected cumulative, seed-conditioned")
     
     ax.set_xlabel("Year")
     ax.set_ylabel("log1p cumulative LSPV adoptions")
@@ -822,7 +1000,7 @@ def main() -> int:
     plt.close(fig)
     
     actual_cum_node = data.Y.sum(axis=0)
-    pred_cum_node = details["cum_mu_total"]
+    pred_cum_node = node_predictions["sssb"].sum(axis=0)
     
     adoption_scale = str(cfg_named["density"].get("adoption_plot_scale", "log1p"))
     
@@ -864,7 +1042,6 @@ def main() -> int:
     
         actual_cbar_label = "Observed cumulative count"
         pred_cbar_label = "ln(predicted cumulative mean count)"
-        shared_cbar_label = None
     
     else:
         raise ValueError("adoption_plot_scale must be 'linear', 'log1p', or 'mixed'.")
@@ -962,8 +1139,8 @@ def main() -> int:
     fig, ax = plt.subplots(figsize=(10, 6), constrained_layout=True)
 
     ax.plot(calendar_rate_months, rate_obs, label="Observed data")
-    ax.plot(calendar_rate_months, rate_bass, label="Classic Bass fit")
-    ax.plot(calendar_rate_months, rate_model, label="SSSB expected rate")
+    ax.plot(calendar_rate_months, rate_bass, label="Classic Bass fit, seed-conditioned")
+    ax.plot(calendar_rate_months, rate_model, label="SSSB expected rate, seed-conditioned")
     
     ax.set_xlabel("Year")
     ax.set_ylabel("Adoption rate, adoptions/year")
@@ -978,8 +1155,8 @@ def main() -> int:
     fig, ax = plt.subplots(figsize=(10, 6), constrained_layout=True)
 
     ax.plot(calendar_rate_months, np.log1p(rate_obs), label="Observed data")
-    ax.plot(calendar_rate_months, np.log1p(rate_bass), label="Classic Bass fit")
-    ax.plot(calendar_rate_months, np.log1p(rate_model), label="SSSB expected rate")
+    ax.plot(calendar_rate_months, np.log1p(rate_bass), label="Classic Bass fit, seed-conditioned")
+    ax.plot(calendar_rate_months, np.log1p(rate_model), label="SSSB expected rate, seed-conditioned")
     
     ax.set_xlabel("Year")
     ax.set_ylabel("ln(1 + adoption rate)")
@@ -996,8 +1173,12 @@ def main() -> int:
         "fit_json": str(fit_json),
         "nll": float(nll),
         "years": data.years.astype(int).tolist(),
-        "observed_total": float(annual_obs.sum()),
-        "model_expected_total": float(annual_model.sum()),
+        "observed_total_full_window": float(annual_obs.sum()),
+        "model_expected_total_full_window": float(annual_model.sum()),
+        "observed_total_instantaneous_metric_window": float(annual_obs_eval.sum()),
+        "model_expected_total_instantaneous_metric_window": float(annual_model_eval.sum()),
+        "metric_window_start_year": int(data.years[eval_start]),
+        "metric_window_end_year": int(data.years[-1]),
         "aggregate_metrics": {
             "yearly_counts": {
                 "sssb": {
@@ -1044,6 +1225,13 @@ def main() -> int:
         "topk_hit_concentration": ranking_metrics,
         "calibration_by_risk_bin": calibration_metrics,
         "neighborhood_spatial_metrics": neighborhood_metrics,
+        "conditioned_seed_year": int(solver_cfg.seed_year) if getattr(solver_cfg, "condition_on_seed_year", False) else None,
+        "instantaneous_metric_years": data.years[eval_start:].astype(int).tolist(),
+        "cumulative_metric_years": data.years.astype(int).tolist(),
+        "plot_years": data.years.astype(int).tolist(),
+        "observed_total_post_seed": float(annual_obs_eval.sum()),
+        "model_expected_total_full_window_conditioned": float(annual_model_conditioned.sum()),
+        "model_expected_total_post_seed": float(annual_model_eval.sum()),
     }
 
     metrics_path = out_dir / "metrics.json"

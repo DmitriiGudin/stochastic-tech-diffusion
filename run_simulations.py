@@ -74,6 +74,23 @@ def observed_monthly_curve(Y: np.ndarray):
     return t, cum
 
 
+def observed_seed_cumulative(
+    *,
+    Y: np.ndarray,
+    years: np.ndarray,
+    seed_year: int,
+) -> tuple[np.ndarray, int, np.ndarray]:
+    matches = np.where(years == int(seed_year))[0]
+    if matches.size == 0:
+        raise ValueError(f"seed_year={seed_year} not found in years.")
+
+    seed_idx = int(matches[0])
+    seed_cum_hist = np.cumsum(Y[: seed_idx + 1], axis=0).astype(float)
+    seed_cum = seed_cum_hist[-1].copy()
+
+    return seed_cum, seed_idx, seed_cum_hist
+
+
 def information_effect(I: np.ndarray, params: SSSBFitParams) -> np.ndarray:
     I = np.maximum(np.asarray(I, dtype=float), 0.0)
     a = float(getattr(params, "FI_a", 1.0))
@@ -399,6 +416,7 @@ def simulate_bass_baseline(
     years: np.ndarray,
     forecast_year: int,
     seed: int,
+    seed_cum_hist: np.ndarray | None = None,
 ) -> dict:
     rng = np.random.default_rng(seed)
 
@@ -410,10 +428,20 @@ def simulate_bass_baseline(
     weights = np.clip(weights, 0.0, None)
     weights = weights / weights.sum() if weights.sum() > 0 else np.full(n_nodes, 1 / n_nodes)
 
-    cum = np.zeros(n_nodes, dtype=int)
     hist = np.zeros((all_years.size, n_nodes), dtype=float)
-
+    
+    if seed_cum_hist is not None:
+        seed_cum_hist = np.asarray(seed_cum_hist, dtype=float)
+        seed_idx = seed_cum_hist.shape[0] - 1
+        hist[: seed_idx + 1] = seed_cum_hist
+        cum = seed_cum_hist[-1].astype(int).copy()
+    else:
+        seed_idx = -1
+        cum = np.zeros(n_nodes, dtype=int)
+    
     for k, mu_total in enumerate(annual_expected):
+        if k <= seed_idx:
+            continue
         total = rng.poisson(max(float(mu_total), 0.0))
         yearly = rng.multinomial(total, weights)
         cum += yearly
@@ -430,6 +458,7 @@ def simulate_bass_baseline_batch(
     forecast_year: int,
     seed: int,
     n_sims: int,
+    seed_cum_hist: np.ndarray | None = None,
 ) -> dict:
     rng = np.random.default_rng(seed)
 
@@ -441,10 +470,21 @@ def simulate_bass_baseline_batch(
     weights = np.clip(weights, 0.0, None)
     weights = weights / weights.sum() if weights.sum() > 0 else np.full(n_nodes, 1.0 / n_nodes)
 
-    cum = np.zeros((n_sims, n_nodes), dtype=np.int32)
     hist = np.zeros((n_sims, all_years.size, n_nodes), dtype=np.float32)
-
+    
+    if seed_cum_hist is not None:
+        seed_cum_hist = np.asarray(seed_cum_hist, dtype=np.float32)
+        seed_idx = seed_cum_hist.shape[0] - 1
+    
+        hist[:, : seed_idx + 1, :] = seed_cum_hist[None, :, :]
+        cum = np.repeat(seed_cum_hist[-1][None, :], n_sims, axis=0).astype(np.int32)
+    else:
+        seed_idx = -1
+        cum = np.zeros((n_sims, n_nodes), dtype=np.int32)
+    
     for yy, mu_total in enumerate(annual_expected):
+        if yy <= seed_idx:
+            continue
         totals = rng.poisson(max(float(mu_total), 0.0), size=n_sims)
 
         for rr in range(n_sims):
@@ -979,6 +1019,16 @@ def main() -> int:
     uniform_weights = np.full(n_nodes, 1.0 / n_nodes)
     pop = np.clip(np.asarray(data.population, dtype=float), 0.0, None)
     pop_weights = pop / pop.sum() if pop.sum() > 0 else uniform_weights
+    
+    observed_cum_hist = np.cumsum(data.Y, axis=0)
+    
+    seed_cum_hist = None
+    if getattr(solver_cfg, "condition_on_seed_year", False):
+        _, _, seed_cum_hist = observed_seed_cumulative(
+            Y=data.Y,
+            years=data.years,
+            seed_year=int(solver_cfg.seed_year),
+        )
 
     t0 = time.perf_counter()
     bass_uniform = simulate_bass_baseline(
@@ -987,6 +1037,7 @@ def main() -> int:
         years=data.years,
         forecast_year=forecast_year,
         seed=seed + 1,
+        seed_cum_hist=seed_cum_hist,
     )
     sim_times["bass_uniform"] = time.perf_counter() - t0
     
@@ -997,6 +1048,7 @@ def main() -> int:
         years=data.years,
         forecast_year=forecast_year,
         seed=seed + 2,
+        seed_cum_hist=seed_cum_hist,
     )
     sim_times["bass_population"] = time.perf_counter() - t0
 
@@ -1029,6 +1081,7 @@ def main() -> int:
             forecast_year=forecast_year,
             seed=seed + 20_000,
             n_sims=n_batch,
+            seed_cum_hist=seed_cum_hist,
         )
         
         batch_population = simulate_bass_baseline_batch(
@@ -1038,6 +1091,7 @@ def main() -> int:
             forecast_year=forecast_year,
             seed=seed + 30_000,
             n_sims=n_batch,
+            seed_cum_hist=seed_cum_hist,
         )
         
         sssb_mean = batch["mean_cum"]
@@ -1050,18 +1104,24 @@ def main() -> int:
         print(f"  n_sims: {n_batch}")
         print(f"  total time: {batch_elapsed:.4f} sec")
         print(f"  time per simulation: {batch_elapsed / max(n_batch, 1):.6f} sec")
-        print(f"  final total mean: {float(np.mean(final_totals)):.3f}")
-        print(f"  final total std:  {float(np.std(final_totals)):.3f}")
-        print(f"  final total min:  {float(np.min(final_totals)):.3f}")
-        print(f"  final total max:  {float(np.max(final_totals)):.3f}")
-        print(f"  final total nonzero fraction: {float(np.mean(final_totals > 0.0)):.3f}")
+        print(f"  forecast final total mean: {float(np.mean(final_totals)):.3f}")
+        print(f"  forecast final total std:  {float(np.std(final_totals)):.3f}")
+        print(f"  forecast final total min:  {float(np.min(final_totals)):.3f}")
+        print(f"  forecast final total max:  {float(np.max(final_totals)):.3f}")
+        print(f"  forecast final total nonzero fraction: {float(np.mean(final_totals > 0.0)):.3f}")
         print(f"  fitted expected historical total: {float(details['mu'].sum()):.3f}")
         print(f"  observed historical total: {float(data.Y.sum()):.3f}")
 
-    observed_cum_hist = np.cumsum(data.Y, axis=0)
-
     fit_end_idx = len(data.years) - 1
     forecast_idx = len(all_years) - 1
+    
+    hist_totals = batch["cum_hist"][:, fit_end_idx, :].sum(axis=1)
+    if run_batch:
+        print(f"  historical final total mean: {float(np.mean(hist_totals)):.3f}")
+        print(f"  historical final total std:  {float(np.std(hist_totals)):.3f}")
+        print(f"  historical final total min:  {float(np.min(hist_totals)):.3f}")
+        print(f"  historical final total max:  {float(np.max(hist_totals)):.3f}")
+        print(f"  historical final total nonzero fraction: {float(np.mean(hist_totals > 0.0)):.3f}")
 
     epsg_project = int(cfg_named["mesh"]["epsg_project"])
 
@@ -1173,19 +1233,66 @@ def main() -> int:
         )
         
         n_obs_years = data.Y.shape[0]
-
-        model_batches = {
+        
+        model_batches_full = {
             "SSSB": batch["cum_hist"][:, :n_obs_years, :],
             "Uniform Bass": batch_uniform["cum_hist"][:, :n_obs_years, :],
             "Population Bass": batch_population["cum_hist"][:, :n_obs_years, :],
         }
         
-        spatial_metrics = compute_spatial_binary_metrics(
+        # Full-period metrics are used for plots, so the conditioning interval is visible.
+        spatial_metrics_full = compute_spatial_binary_metrics(
             Y_obs=data.Y,
-            model_batches=model_batches,
+            model_batches=model_batches_full,
         )
         
-        print_spatial_metric_table(spatial_metrics)
+        # Printed summaries use only post-seed years.
+        if getattr(solver_cfg, "condition_on_seed_year", False):
+            _, seed_idx, _ = observed_seed_cumulative(
+                Y=data.Y,
+                years=data.years,
+                seed_year=int(solver_cfg.seed_year),
+            )
+            eval_start = seed_idx + 1
+        else:
+            seed_idx = -1
+            eval_start = 0
+        
+        if eval_start >= n_obs_years:
+            raise ValueError(
+                f"No post-seed years available: seed_year={solver_cfg.seed_year}, "
+                f"observed years={data.years[0]}-{data.years[-1]}."
+            )
+        
+        model_batches_eval = {
+            name: arr[:, eval_start:n_obs_years, :]
+            for name, arr in model_batches_full.items()
+        }
+        
+        spatial_metrics_eval_new = compute_spatial_binary_metrics(
+            Y_obs=data.Y[eval_start:n_obs_years, :],
+            model_batches=model_batches_eval,
+        )
+        
+        # Full-window cumulative metrics: cumulative occupancy must include the
+        # conditioned seed period because those seed adoptions are part of the
+        # realized cumulative state.
+        spatial_metrics_eval_cum = compute_spatial_binary_metrics(
+            Y_obs=data.Y,
+            model_batches=model_batches_full,
+        )
+        
+        spatial_metrics_eval = {
+            "hamming_new": spatial_metrics_eval_new["hamming_new"],
+            "jaccard_new": spatial_metrics_eval_new["jaccard_new"],
+            "hamming_cum": spatial_metrics_eval_cum["hamming_cum"],
+            "jaccard_cum": spatial_metrics_eval_cum["jaccard_cum"],
+        }
+        
+        print("[SIM metrics] yearly-new summaries use post-seed years only.")
+        print("[SIM metrics] cumulative summaries use full seed-conditioned window.")
+        
+        print_spatial_metric_table(spatial_metrics_eval)
         
         metric_dir = out_dir / "metrics"
         metric_dir.mkdir(parents=True, exist_ok=True)
@@ -1223,7 +1330,7 @@ def main() -> int:
         
         for metric_key, title, ylabel, higher_is_better, fname in metric_plot_specs:
             curves = {}
-            for model_name, arr in spatial_metrics[metric_key].items():
+            for model_name, arr in spatial_metrics_full[metric_key].items():
                 mean, std = metric_curve_summary(arr)
                 curves[model_name] = (mean, std)
         
