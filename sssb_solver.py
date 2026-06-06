@@ -31,6 +31,10 @@ class SSSBFitConfig:
     normalize_nll: bool = True
     capacity_link: str = "logistic"
     standardize_covariates: bool = True
+
+    condition_on_seed_year: bool = False
+    seed_year: int = 2007
+    include_seed_likelihood: bool = True
     
     
 def information_effect(I: np.ndarray, params: SSSBFitParams) -> np.ndarray:
@@ -221,9 +225,51 @@ def observed_driven_nll(
     mu = np.zeros_like(Y, dtype=float)
     mu_U = np.zeros_like(Y, dtype=float)
     mu_V = np.zeros_like(Y, dtype=float)
+    
+    seed_idx = None
+    if cfg.condition_on_seed_year:
+        matches = np.where(years == int(cfg.seed_year))[0]
+        if matches.size == 0:
+            raise ValueError(f"seed_year={cfg.seed_year} not found in years.")
+        seed_idx = int(matches[0])
 
     for yi in range(n_years):
         Y_year = Y[yi]
+        
+        if seed_idx is not None and yi == seed_idx:
+            R = np.clip(K - W_cum, 0.0, None)
+        
+            # Seed-year events are treated as innovations.
+            # They can still contribute to likelihood, forcing p*K to be plausible.
+            if cfg.include_seed_likelihood:
+                mu_seed = p * R
+                mu_U[yi] = mu_seed
+                mu_V[yi] = 0.0
+                mu[yi] = mu_seed
+        
+            # But state evolution is conditioned on the observed seed events.
+            jump = Y_year / n_sub
+        
+            for _ in range(n_sub):
+                with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
+                    J_plus = J + jump
+                    I_new = I + dt * gamma_J * J_plus
+                    LJ = L @ J_plus
+                    J_new = J_plus + dt * (-k_J * J_plus + D * LJ + S0)
+        
+                if (
+                    not np.all(np.isfinite(I_new))
+                    or not np.all(np.isfinite(J_new))
+                ):
+                    if return_details:
+                        return np.inf, {}
+                    return np.inf
+        
+                I = np.maximum(I_new, 0.0)
+                J = np.maximum(J_new, 0.0)
+        
+            W_cum += Y_year
+            continue
 
         R = np.clip(K - W_cum, 0.0, None)
         jump = Y_year / n_sub

@@ -353,6 +353,10 @@ def fit_model(config_name: str, cfg: dict, msh_path: Path, features_path: Path) 
         normalize_nll=True,
         capacity_link=str(cfg["capacity"].get("link", "logistic")),
         standardize_covariates=bool(cfg["capacity"].get("standardize_covariates", True)),
+    
+        condition_on_seed_year=bool(fit.get("condition_on_seed_year", False)),
+        seed_year=int(fit.get("seed_year", 2007)),
+        include_seed_likelihood=bool(fit.get("include_seed_likelihood", True)),
     )
 
     def objective(theta: np.ndarray) -> float:

@@ -24,10 +24,10 @@ DEFAULT = {
     },
 
     "density": {
-        "smooth_length_km": 75.0,
-        "smooth_k_neighbors": 32,
+        "smooth_length_km": 75,
+        "smooth_k_neighbors": 100,
         "smooth_kernel": "gaussian",
-        "transmission_buffer_km": 15,
+        "transmission_buffer_km": 100,
         "plot_pop_year": 2020,
         "adoption_plot_scale": "log1p",  # "linear", "log1p" or "mixed"
         "mixed_log_range": 8.0,
@@ -45,6 +45,9 @@ DEFAULT = {
         "population_key": "population_smooth_2020",
         "progress_freq": 10,
         "year_window": None,  # e.g. [2007, 2025], inclusive
+        "condition_on_seed_year": True,
+        "seed_year": 2007, # condition on all observed years from start year through this year
+        "include_seed_likelihood": True,
     },
     
     "capacity": {
@@ -53,23 +56,23 @@ DEFAULT = {
     },
 
     "param_bounds": {
-        "p": [1e-6, 1e-1],
-        "q": [1e-5, 1],
-        "gamma_J": [1e-3, 1],
-        "k_J": [1e-6, 1],
-        "D": [1, 1e5],
+        "p": [1e-9, 1e-4],
+        "q": [1e-5, 0.1],
+        "gamma_J": [1e-3, 1000],
+        "k_J": [1e-6, 1e-3],
+        "D": [1e-12, 1],
         "S0": [0, 0],
-        "r_max": [1e-7, 1e-3],
-        "r0": [1e-15, 1e-10],
-        "r1": [1e-8, 1e-4],
-        "r2": [1e-15, 1e-10],
-        "FI_a": [0.01, 10],
+        "r_max": [1e-6, 1e-2],
+        "r0": [0.01, 100],
+        "r1": [0.01, 100],
+        "r2": [0.01, 100],
+        "FI_a": [0.01, 100],
         "FI_b": [0.01, 10],
-        "FI_c": [0.01, 10],
+        "FI_c": [0.1, 100],
     },
 
     "initial": {
-        "p": 1e-2,
+        "p": 1e-4,
         "q": 1e-1,
         "gamma_J": 1e-1,
         "k_J": 0.01,
@@ -86,10 +89,11 @@ DEFAULT = {
     
     "simulation": {
         "forecast_year": 2050,
-        "seed": 2026,
+        "seed": 1337,
         "fps": 2,
-        "batch_diagnostic_n_sims": 100,
-        "run_batch_diagnostic": True,
+        "n_single_runs": 5,
+        "run_batch": True,
+        "batch_n_sims": 10,
     },
 }
 
@@ -106,18 +110,14 @@ CONFIGS = {
             "h_km": 6,
             "simplify_km": 18,
         },
-        "density": {
-            "smooth_length_km": 75,
-            "smooth_kernel": "gaussian",
-            "transmission_buffer_km": 100,
-        },
         "fit": {
             "year_window": [2007, 2025],
+            "seed_year": 2007,
             "use_covariates": True,
             "fit_S0": False,
-            "n_random": 500, #10000
+            "n_random": 1000, #10000
             "maxiter": 500,
-            "dt_years": 0.1,
+            "dt_years": 0.05,
         },
     },
 }

@@ -83,6 +83,101 @@ def information_effect(I: np.ndarray, params: SSSBFitParams) -> np.ndarray:
     base = I / (1.0 + a * I)
     with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
         return np.maximum(np.power(base, b) * (-np.expm1(-c * I)), 0.0)
+    
+    
+def initialize_from_seed_year(
+    *,
+    data,
+    years: np.ndarray,
+    params: SSSBFitParams,
+    solver_cfg: SSSBFitConfig,
+    seed_year: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, int]:
+    matches = np.where(years == int(seed_year))[0]
+    if matches.size == 0:
+        raise ValueError(f"seed_year={seed_year} not found in years.")
+
+    seed_idx = int(matches[0])
+    Y_seed = data.Y[seed_idx].astype(float)
+
+    n_nodes = Y_seed.size
+    U = Y_seed.astype(np.int64)
+    V = np.zeros(n_nodes, dtype=np.int64)
+    I = np.zeros(n_nodes, dtype=float)
+    J = np.zeros(n_nodes, dtype=float)
+
+    dt = float(solver_cfg.dt_years)
+    n_sub = int(round(1.0 / dt))
+    dt = 1.0 / n_sub
+
+    gamma_J = float(params.gamma_J)
+    k_J = float(params.k_J)
+    D = float(params.D)
+    S0 = float(params.S0)
+    L = data.L
+
+    jump = Y_seed / n_sub
+
+    for _ in range(n_sub):
+        J_plus = J + jump
+        I_new = I + dt * gamma_J * J_plus
+        J_new = J_plus + dt * (-k_J * J_plus + D * (L @ J_plus) + S0)
+
+        I = np.maximum(I_new, 0.0)
+        J = np.maximum(J_new, 0.0)
+
+    return U, V, I, J, seed_idx
+
+
+def sssb_one_step(
+    *,
+    rng,
+    U,
+    V,
+    I,
+    J,
+    capacity,
+    L,
+    params,
+    dt,
+):
+    R = np.maximum(capacity - U - V, 0.0)
+
+    FI = information_effect(I, params)
+
+    rate_U = float(params.p) * R
+    rate_V = float(params.q) * FI * R
+    rate_total = rate_U + rate_V
+
+    lam = np.maximum(rate_total * dt, 0.0)
+    d_total = rng.poisson(lam)
+
+    cap_remaining = np.maximum(np.ceil(R).astype(int), 0)
+    d_total = np.minimum(d_total, cap_remaining)
+
+    innov_prob = np.ones_like(rate_total, dtype=float)
+    np.divide(rate_U, rate_total, out=innov_prob, where=rate_total > 0.0)
+    innov_prob = np.clip(innov_prob, 0.0, 1.0)
+
+    dU = rng.binomial(d_total, innov_prob)
+    dV = d_total - dU
+
+    U = U + dU
+    V = V + dV
+
+    J_plus = J + d_total.astype(float)
+
+    I_new = I + dt * float(params.gamma_J) * J_plus
+    J_new = J_plus + dt * (
+        -float(params.k_J) * J_plus
+        + float(params.D) * (L @ J_plus)
+        + float(params.S0)
+    )
+
+    I = np.maximum(I_new, 0.0)
+    J = np.maximum(J_new, 0.0)
+
+    return U, V, I, J, dU, dV
 
 
 def simulate_sssb_stochastic(
@@ -105,12 +200,22 @@ def simulate_sssb_stochastic(
     n_sub = int(round(1.0 / dt))
     dt = 1.0 / n_sub
 
-    U = np.zeros(n_nodes, dtype=np.int64)
-    V = np.zeros(n_nodes, dtype=np.int64)
-    I = np.zeros(n_nodes, dtype=float)
-    J = np.zeros(n_nodes, dtype=float)
-
     cum_hist = np.zeros((all_years.size, n_nodes), dtype=float)
+    
+    if getattr(solver_cfg, "condition_on_seed_year", False):
+        U, V, I, J, seed_idx = initialize_from_seed_year(
+            data=data,
+            years=years,
+            params=params,
+            solver_cfg=solver_cfg,
+            seed_year=int(solver_cfg.seed_year),
+        )
+    else:
+        U = np.zeros(n_nodes, dtype=np.int64)
+        V = np.zeros(n_nodes, dtype=np.int64)
+        I = np.zeros(n_nodes, dtype=float)
+        J = np.zeros(n_nodes, dtype=float)
+        seed_idx = -1
 
     p = float(params.p)
     q = float(params.q)
@@ -121,39 +226,31 @@ def simulate_sssb_stochastic(
     L = data.L
 
     for yy, year in enumerate(all_years):
+        if yy <= seed_idx:
+            cum_hist[yy] = U + V
+            print(
+                f"[SSSB sim] year={year} "
+                f"total_cum={float(cum_hist[yy].sum()):.0f} "
+                f"max_node_cum={float(cum_hist[yy].max()):.0f} "
+                f"seed-conditioned"
+            )
+            continue
+        
+        year_new_adoptions = 0
+        
         for _ in range(n_sub):
-            R = np.maximum(capacity - U - V, 0.0)
-
-            FI = information_effect(I, params)
-            rate_U = p * R
-            rate_V = q * FI * R
-            rate_total = rate_U + rate_V
-
-            lam = np.maximum(rate_total * dt, 0.0)
-            d_total = rng.poisson(lam)
-            
-            # Hard cap only where capacity is already nearly exhausted.
-            cap_remaining = np.maximum(np.ceil(R).astype(int), 0)
-            d_total = np.minimum(d_total, cap_remaining)
-
-            innov_prob = np.ones_like(rate_total, dtype=float)
-            np.divide(rate_U, rate_total, out=innov_prob, where=rate_total > 0.0)
-            innov_prob = np.clip(innov_prob, 0.0, 1.0)
-
-            dU = rng.binomial(d_total, innov_prob)
-            dV = d_total - dU
-
-            U += dU
-            V += dV
-
-            jumps = d_total.astype(float)
-            J_plus = J + jumps
-
-            I_new = I + dt * gamma_J * J_plus
-            J_new = J_plus + dt * (-k_J * J_plus + D * (L @ J_plus) + S0)
-
-            I = np.maximum(I_new, 0.0)
-            J = np.maximum(J_new, 0.0)
+            U, V, I, J, dU, dV = sssb_one_step(
+                rng=rng,
+                U=U,
+                V=V,
+                I=I,
+                J=J,
+                capacity=capacity,
+                L=L,
+                params=params,
+                dt=dt,
+            )
+            year_new_adoptions += int(np.sum(dU + dV))
 
         cum_hist[yy] = U + V
         
@@ -161,6 +258,7 @@ def simulate_sssb_stochastic(
         year_max_node = float(cum_hist[yy].max())
         print(
             f"[SSSB sim] year={year} "
+            f"new={year_new_adoptions:.0f} "
             f"total_cum={year_total:.0f} "
             f"max_node_cum={year_max_node:.0f} "
             f"max_I={float(np.max(I)):.3e} "
@@ -201,12 +299,27 @@ def simulate_sssb_stochastic_batch(
     capacity = np.asarray(capacity, dtype=np.float32)
     L_T = data.L.T.tocsr()
 
-    U = np.zeros((n_sims, n_nodes), dtype=np.int32)
-    V = np.zeros((n_sims, n_nodes), dtype=np.int32)
-    I = np.zeros((n_sims, n_nodes), dtype=np.float32)
-    J = np.zeros((n_sims, n_nodes), dtype=np.float32)
-
     cum_hist = np.zeros((n_sims, all_years.size, n_nodes), dtype=np.float32)
+
+    if getattr(solver_cfg, "condition_on_seed_year", False):
+        U0, V0, I0, J0, seed_idx = initialize_from_seed_year(
+            data=data,
+            years=years,
+            params=params,
+            solver_cfg=solver_cfg,
+            seed_year=int(solver_cfg.seed_year),
+        )
+
+        U = np.repeat(U0[None, :], n_sims, axis=0).astype(np.int32)
+        V = np.repeat(V0[None, :], n_sims, axis=0).astype(np.int32)
+        I = np.repeat(I0[None, :], n_sims, axis=0).astype(np.float32)
+        J = np.repeat(J0[None, :], n_sims, axis=0).astype(np.float32)
+    else:
+        U = np.zeros((n_sims, n_nodes), dtype=np.int32)
+        V = np.zeros((n_sims, n_nodes), dtype=np.int32)
+        I = np.zeros((n_sims, n_nodes), dtype=np.float32)
+        J = np.zeros((n_sims, n_nodes), dtype=np.float32)
+        seed_idx = -1
 
     p = float(params.p)
     q = float(params.q)
@@ -216,6 +329,10 @@ def simulate_sssb_stochastic_batch(
     S0 = float(params.S0)
 
     for yy, year in enumerate(all_years):
+        if yy <= seed_idx:
+            cum_hist[:, yy, :] = U + V
+            continue
+
         for _ in range(n_sub):
             R = np.maximum(capacity[None, :] - U - V, 0.0)
 
@@ -240,8 +357,7 @@ def simulate_sssb_stochastic_batch(
             U += dU
             V += dV
 
-            jumps = d_total.astype(np.float32)
-            J_plus = J + jumps
+            J_plus = J + d_total.astype(np.float32)
 
             I_new = I + dt * gamma_J * J_plus
             LJ = J_plus @ L_T
@@ -293,6 +409,46 @@ def simulate_bass_baseline(
     return {"years": all_years, "cum": hist}
 
 
+def simulate_bass_baseline_batch(
+    *,
+    annual_expected: np.ndarray,
+    weights: np.ndarray,
+    years: np.ndarray,
+    forecast_year: int,
+    seed: int,
+    n_sims: int,
+) -> dict:
+    rng = np.random.default_rng(seed)
+
+    start_year = int(years[0])
+    all_years = np.arange(start_year, int(forecast_year) + 1)
+
+    n_nodes = weights.size
+    weights = np.asarray(weights, dtype=float)
+    weights = np.clip(weights, 0.0, None)
+    weights = weights / weights.sum() if weights.sum() > 0 else np.full(n_nodes, 1.0 / n_nodes)
+
+    cum = np.zeros((n_sims, n_nodes), dtype=np.int32)
+    hist = np.zeros((n_sims, all_years.size, n_nodes), dtype=np.float32)
+
+    for yy, mu_total in enumerate(annual_expected):
+        totals = rng.poisson(max(float(mu_total), 0.0), size=n_sims)
+
+        for rr in range(n_sims):
+            yearly = rng.multinomial(int(totals[rr]), weights)
+            cum[rr] += yearly.astype(np.int32)
+
+        hist[:, yy, :] = cum
+
+    return {
+        "years": all_years,
+        "cum_hist": hist,
+        "mean_cum": hist.mean(axis=0),
+        "std_cum": hist.std(axis=0),
+        "final_totals": hist[:, -1, :].sum(axis=1),
+    }
+
+
 def triangle_boundary_edges(triangles: np.ndarray):
     counts = {}
     for a, b, c in triangles:
@@ -331,7 +487,7 @@ def draw_node_map(
         lat[idx],
         c=vals[idx],
         s=s,
-        cmap="hot_r",
+        cmap="hot",
         vmin=vmin,
         vmax=vmax,
         linewidths=0.0,
@@ -533,17 +689,26 @@ def main() -> int:
     
     sim_times = {}
 
-    t0 = time.perf_counter()
-    sssb = simulate_sssb_stochastic(
-        data=data,
-        params=params,
-        solver_cfg=solver_cfg,
-        capacity=capacity,
-        years=data.years,
-        forecast_year=forecast_year,
-        seed=seed,
-    )
-    sim_times["sssb"] = time.perf_counter() - t0
+    n_single_runs = int(sim_cfg.get("n_single_runs", 1))
+    sssb_runs = []
+    
+    for rr in range(n_single_runs):
+        run_seed = seed + rr
+    
+        t0 = time.perf_counter()
+        sssb_rr = simulate_sssb_stochastic(
+            data=data,
+            params=params,
+            solver_cfg=solver_cfg,
+            capacity=capacity,
+            years=data.years,
+            forecast_year=forecast_year,
+            seed=run_seed,
+        )
+        sim_times[f"sssb_run_{rr:02d}"] = time.perf_counter() - t0
+        sssb_runs.append(sssb_rr)
+    
+    sssb = sssb_runs[0]
 
     n_nodes = data.Y.shape[1]
     uniform_weights = np.full(n_nodes, 1.0 / n_nodes)
@@ -574,8 +739,10 @@ def main() -> int:
     for name, val in sim_times.items():
         print(f"  {name}: {val:.4f} sec")
         
-    if bool(sim_cfg.get("run_batch_diagnostic", True)):
-        n_batch = int(sim_cfg.get("batch_diagnostic_n_sims", 100))
+    run_batch = bool(sim_cfg.get("run_batch", True))
+
+    if run_batch:
+        n_batch = int(sim_cfg.get("batch_n_sims", 100))
     
         t0 = time.perf_counter()
         batch = simulate_sssb_stochastic_batch(
@@ -589,6 +756,28 @@ def main() -> int:
             n_sims=n_batch,
         )
         batch_elapsed = time.perf_counter() - t0
+        
+        batch_uniform = simulate_bass_baseline_batch(
+            annual_expected=annual_bass,
+            weights=uniform_weights,
+            years=data.years,
+            forecast_year=forecast_year,
+            seed=seed + 20_000,
+            n_sims=n_batch,
+        )
+        
+        batch_population = simulate_bass_baseline_batch(
+            annual_expected=annual_bass,
+            weights=pop_weights,
+            years=data.years,
+            forecast_year=forecast_year,
+            seed=seed + 30_000,
+            n_sims=n_batch,
+        )
+        
+        sssb_mean = batch["mean_cum"]
+        bass_uniform_mean = batch_uniform["mean_cum"]
+        bass_population_mean = batch_population["mean_cum"]
     
         final_totals = np.asarray(batch["final_totals"], dtype=float)
     
@@ -664,6 +853,59 @@ def main() -> int:
         ncols=3,
         title=f"Forecast cumulative adoptions through {forecast_year}",
     )
+    
+    # Batch Plots
+    
+    if run_batch:
+        save_static_panels(
+            data=data,
+            panels=[
+                ("Observed cumulative", observed_cum_hist[fit_end_idx]),
+                ("SSSB simulation mean", sssb_mean[fit_end_idx]),
+            ],
+            out_path=out_dir / "fit_end_observed_vs_sssb_batch_mean.png",
+            epsg_project=epsg_project,
+            ncols=2,
+            title=f"Cumulative adoptions through {int(data.years[-1])}: batch mean",
+        )
+    
+        save_static_panels(
+            data=data,
+            panels=[
+                ("Observed cumulative", observed_cum_hist[fit_end_idx]),
+                ("SSSB simulation mean", sssb_mean[fit_end_idx]),
+                ("Uniform Bass simulation mean", bass_uniform_mean[fit_end_idx]),
+                ("Population Bass simulation mean", bass_population_mean[fit_end_idx]),
+            ],
+            out_path=out_dir / "fit_end_all_models_batch_mean.png",
+            epsg_project=epsg_project,
+            ncols=2,
+            title=f"Cumulative adoptions through {int(data.years[-1])}: batch mean",
+        )
+    
+        save_static_panels(
+            data=data,
+            panels=[
+                ("SSSB forecast simulation mean", sssb_mean[forecast_idx]),
+            ],
+            out_path=out_dir / f"forecast_{forecast_year}_sssb_batch_mean.png",
+            epsg_project=epsg_project,
+            ncols=1,
+            title=f"Forecast cumulative adoptions through {forecast_year}: batch mean",
+        )
+    
+        save_static_panels(
+            data=data,
+            panels=[
+                ("SSSB forecast simulation mean", sssb_mean[forecast_idx]),
+                ("Uniform Bass forecast simulation mean", bass_uniform_mean[forecast_idx]),
+                ("Population Bass forecast simulation mean", bass_population_mean[forecast_idx]),
+            ],
+            out_path=out_dir / f"forecast_{forecast_year}_all_models_batch_mean.png",
+            epsg_project=epsg_project,
+            ncols=3,
+            title=f"Forecast cumulative adoptions through {forecast_year}: batch mean",
+        )
 
     # Animations
     hist_years = data.years
