@@ -112,7 +112,7 @@ CONFIGS = {
         },
         "fit": {
             "year_window": [2007, 2025],
-            "seed_year": 2007,
+            "seed_year": 2016,
             "use_covariates": True,
             "fit_S0": False,
             "n_random": 1000, #10000

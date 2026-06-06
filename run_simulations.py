@@ -92,19 +92,28 @@ def initialize_from_seed_year(
     params: SSSBFitParams,
     solver_cfg: SSSBFitConfig,
     seed_year: int,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, int]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, int, np.ndarray]:
+    """
+    Condition on all observed years from years[0] through seed_year, inclusive.
+
+    Returns:
+      U, V, I, J at the end of seed_year,
+      seed_idx,
+      seed_cum_hist with shape (seed_idx + 1, n_nodes)
+    """
     matches = np.where(years == int(seed_year))[0]
     if matches.size == 0:
         raise ValueError(f"seed_year={seed_year} not found in years.")
 
     seed_idx = int(matches[0])
-    Y_seed = data.Y[seed_idx].astype(float)
+    n_nodes = data.Y.shape[1]
 
-    n_nodes = Y_seed.size
-    U = Y_seed.astype(np.int64)
+    U = np.zeros(n_nodes, dtype=np.int64)
     V = np.zeros(n_nodes, dtype=np.int64)
     I = np.zeros(n_nodes, dtype=float)
     J = np.zeros(n_nodes, dtype=float)
+
+    seed_cum_hist = np.zeros((seed_idx + 1, n_nodes), dtype=float)
 
     dt = float(solver_cfg.dt_years)
     n_sub = int(round(1.0 / dt))
@@ -116,17 +125,25 @@ def initialize_from_seed_year(
     S0 = float(params.S0)
     L = data.L
 
-    jump = Y_seed / n_sub
+    for yi in range(seed_idx + 1):
+        Y_seed = data.Y[yi].astype(float)
 
-    for _ in range(n_sub):
-        J_plus = J + jump
-        I_new = I + dt * gamma_J * J_plus
-        J_new = J_plus + dt * (-k_J * J_plus + D * (L @ J_plus) + S0)
+        # Treat all conditioned observed events as innovations.
+        U += Y_seed.astype(np.int64)
 
-        I = np.maximum(I_new, 0.0)
-        J = np.maximum(J_new, 0.0)
+        jump = Y_seed / n_sub
 
-    return U, V, I, J, seed_idx
+        for _ in range(n_sub):
+            J_plus = J + jump
+            I_new = I + dt * gamma_J * J_plus
+            J_new = J_plus + dt * (-k_J * J_plus + D * (L @ J_plus) + S0)
+
+            I = np.maximum(I_new, 0.0)
+            J = np.maximum(J_new, 0.0)
+
+        seed_cum_hist[yi] = U + V
+
+    return U, V, I, J, seed_idx, seed_cum_hist
 
 
 def sssb_one_step(
@@ -203,7 +220,7 @@ def simulate_sssb_stochastic(
     cum_hist = np.zeros((all_years.size, n_nodes), dtype=float)
     
     if getattr(solver_cfg, "condition_on_seed_year", False):
-        U, V, I, J, seed_idx = initialize_from_seed_year(
+        U, V, I, J, seed_idx, seed_cum_hist = initialize_from_seed_year(
             data=data,
             years=years,
             params=params,
@@ -216,6 +233,7 @@ def simulate_sssb_stochastic(
         I = np.zeros(n_nodes, dtype=float)
         J = np.zeros(n_nodes, dtype=float)
         seed_idx = -1
+        seed_cum_hist = None
 
     p = float(params.p)
     q = float(params.q)
@@ -227,7 +245,7 @@ def simulate_sssb_stochastic(
 
     for yy, year in enumerate(all_years):
         if yy <= seed_idx:
-            cum_hist[yy] = U + V
+            cum_hist[yy] = seed_cum_hist[yy]
             print(
                 f"[SSSB sim] year={year} "
                 f"total_cum={float(cum_hist[yy].sum()):.0f} "
@@ -302,7 +320,7 @@ def simulate_sssb_stochastic_batch(
     cum_hist = np.zeros((n_sims, all_years.size, n_nodes), dtype=np.float32)
 
     if getattr(solver_cfg, "condition_on_seed_year", False):
-        U0, V0, I0, J0, seed_idx = initialize_from_seed_year(
+        U0, V0, I0, J0, seed_idx, seed_cum_hist = initialize_from_seed_year(
             data=data,
             years=years,
             params=params,
@@ -320,6 +338,7 @@ def simulate_sssb_stochastic_batch(
         I = np.zeros((n_sims, n_nodes), dtype=np.float32)
         J = np.zeros((n_sims, n_nodes), dtype=np.float32)
         seed_idx = -1
+        seed_cum_hist = None
 
     p = float(params.p)
     q = float(params.q)
@@ -330,7 +349,7 @@ def simulate_sssb_stochastic_batch(
 
     for yy, year in enumerate(all_years):
         if yy <= seed_idx:
-            cum_hist[:, yy, :] = U + V
+            cum_hist[:, yy, :] = seed_cum_hist[yy][None, :]
             continue
 
         for _ in range(n_sub):
