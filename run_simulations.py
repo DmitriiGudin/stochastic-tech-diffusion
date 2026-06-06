@@ -235,12 +235,6 @@ def simulate_sssb_stochastic(
         seed_idx = -1
         seed_cum_hist = None
 
-    p = float(params.p)
-    q = float(params.q)
-    gamma_J = float(params.gamma_J)
-    k_J = float(params.k_J)
-    D = float(params.D)
-    S0 = float(params.S0)
     L = data.L
 
     for yy, year in enumerate(all_years):
@@ -632,6 +626,258 @@ def save_animation(
     anim.save(out_path, writer=PillowWriter(fps=fps))
     plt.close(fig)
     print("[SIM animation] saved:", out_path)
+    
+    
+def binary_new_from_cum(cum_hist: np.ndarray) -> np.ndarray:
+    """
+    Convert cumulative simulated counts to yearly new binary occupancy.
+
+    Input:
+        cum_hist: shape (n_sims, n_years, n_nodes)
+
+    Output:
+        new_binary: shape (n_sims, n_years, n_nodes)
+        where entry is True iff at least one new adoption occurred
+        at that node in that year.
+    """
+    cum_hist = np.asarray(cum_hist, dtype=float)
+
+    new_counts = np.empty_like(cum_hist)
+    new_counts[:, 0, :] = cum_hist[:, 0, :]
+    new_counts[:, 1:, :] = cum_hist[:, 1:, :] - cum_hist[:, :-1, :]
+
+    return new_counts > 0.0
+
+
+def binary_cum_from_cum(cum_hist: np.ndarray) -> np.ndarray:
+    """
+    Convert cumulative simulated counts to cumulative binary occupancy.
+
+    Entry is True iff node has had at least one adoption by that year.
+    """
+    return np.asarray(cum_hist, dtype=float) > 0.0
+
+
+def observed_binary_new(Y: np.ndarray) -> np.ndarray:
+    """
+    Observed yearly new binary occupancy.
+
+    Input:
+        Y: shape (n_years, n_nodes)
+
+    Output:
+        shape (n_years, n_nodes)
+    """
+    return np.asarray(Y, dtype=float) > 0.0
+
+
+def observed_binary_cum(Y: np.ndarray) -> np.ndarray:
+    """
+    Observed cumulative binary occupancy.
+
+    Input:
+        Y: shape (n_years, n_nodes)
+
+    Output:
+        shape (n_years, n_nodes)
+    """
+    return np.cumsum(np.asarray(Y, dtype=float), axis=0) > 0.0
+
+
+def hamming_by_sim_year(
+    sim_binary: np.ndarray,
+    obs_binary: np.ndarray,
+) -> np.ndarray:
+    """
+    Hamming distance between simulated and observed binary occupancy.
+
+    sim_binary: shape (n_sims, n_years, n_nodes)
+    obs_binary: shape (n_years, n_nodes)
+
+    Returns:
+        shape (n_sims, n_years)
+    """
+    sim_binary = np.asarray(sim_binary, dtype=bool)
+    obs_binary = np.asarray(obs_binary, dtype=bool)
+
+    return np.sum(sim_binary != obs_binary[None, :, :], axis=2).astype(float)
+
+
+def jaccard_by_sim_year(
+    sim_binary: np.ndarray,
+    obs_binary: np.ndarray,
+) -> np.ndarray:
+    """
+    Jaccard similarity between simulated and observed binary occupancy.
+
+    J = |intersection| / |union|.
+
+    If both observed and simulated active sets are empty, define J = 1.
+    """
+    sim_binary = np.asarray(sim_binary, dtype=bool)
+    obs_binary = np.asarray(obs_binary, dtype=bool)
+
+    intersection = np.sum(sim_binary & obs_binary[None, :, :], axis=2).astype(float)
+    union = np.sum(sim_binary | obs_binary[None, :, :], axis=2).astype(float)
+
+    out = np.ones_like(intersection, dtype=float)
+    np.divide(intersection, union, out=out, where=union > 0.0)
+    return out
+
+
+def metric_curve_summary(metric_by_sim_year: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Mean and standard deviation across simulations, year by year.
+    """
+    arr = np.asarray(metric_by_sim_year, dtype=float)
+    return arr.mean(axis=0), arr.std(axis=0)
+
+
+def metric_overall_summary(metric_by_sim_year: np.ndarray) -> tuple[float, float]:
+    """
+    Mean and standard deviation across all simulation-year pairs.
+    """
+    arr = np.asarray(metric_by_sim_year, dtype=float).ravel()
+    return float(np.mean(arr)), float(np.std(arr))
+
+
+def final_year_summary(metric_by_sim_year: np.ndarray) -> tuple[float, float]:
+    """
+    Mean and standard deviation across simulations in the final year.
+    """
+    arr = np.asarray(metric_by_sim_year, dtype=float)[:, -1]
+    return float(np.mean(arr)), float(np.std(arr))
+
+
+def plot_metric_curves(
+    *,
+    years: np.ndarray,
+    curves: dict[str, tuple[np.ndarray, np.ndarray]],
+    out_path: Path,
+    title: str,
+    ylabel: str,
+    higher_is_better: bool,
+) -> None:
+    """
+    Plot mean +/- 1 std for each model.
+
+    curves[name] = (mean_by_year, std_by_year)
+    """
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    fig, ax = plt.subplots(figsize=(10, 6), constrained_layout=True)
+
+    for name, (mean, std) in curves.items():
+        mean = np.asarray(mean, dtype=float)
+        std = np.asarray(std, dtype=float)
+
+        ax.plot(years, mean, label=name)
+        ax.fill_between(
+            years,
+            mean - std,
+            mean + std,
+            alpha=0.2,
+            linewidth=0.0,
+        )
+
+    ax.set_xlabel("Year")
+    ax.set_ylabel(ylabel)
+    ax.set_title(title)
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+
+    direction = "Higher is better" if higher_is_better else "Lower is better"
+    ax.text(
+        0.01,
+        0.02,
+        direction,
+        transform=ax.transAxes,
+        ha="left",
+        va="bottom",
+        fontsize=10,
+        alpha=0.8,
+    )
+
+    fig.savefig(out_path, dpi=180)
+    plt.close(fig)
+    print("[SIM metric plot] saved:", out_path)
+
+
+def compute_spatial_binary_metrics(
+    *,
+    Y_obs: np.ndarray,
+    model_batches: dict[str, np.ndarray],
+) -> dict[str, dict[str, np.ndarray]]:
+    """
+    Compute Hamming and Jaccard metrics for all models.
+
+    model_batches[name] = cumulative simulation history,
+                          shape (n_sims, n_years, n_nodes)
+
+    Returns nested dict:
+        metrics[metric_name][model_name] = array shape (n_sims, n_years)
+    """
+    obs_new = observed_binary_new(Y_obs)
+    obs_cum = observed_binary_cum(Y_obs)
+
+    out = {
+        "hamming_new": {},
+        "hamming_cum": {},
+        "jaccard_new": {},
+        "jaccard_cum": {},
+    }
+
+    for name, cum_hist in model_batches.items():
+        sim_new = binary_new_from_cum(cum_hist)
+        sim_cum = binary_cum_from_cum(cum_hist)
+
+        out["hamming_new"][name] = hamming_by_sim_year(sim_new, obs_new)
+        out["hamming_cum"][name] = hamming_by_sim_year(sim_cum, obs_cum)
+        out["jaccard_new"][name] = jaccard_by_sim_year(sim_new, obs_new)
+        out["jaccard_cum"][name] = jaccard_by_sim_year(sim_cum, obs_cum)
+
+    return out
+
+
+def print_spatial_metric_table(metrics: dict[str, dict[str, np.ndarray]]) -> None:
+    """
+    Print overall mean/std and final-year mean/std.
+    """
+    metric_labels = {
+        "hamming_new": "Hamming, new adoptions",
+        "hamming_cum": "Hamming, cumulative adoptions",
+        "jaccard_new": "Jaccard, new adoptions",
+        "jaccard_cum": "Jaccard, cumulative adoptions",
+    }
+
+    print("\n[SIM spatial binary metrics]")
+    print("Overall summaries aggregate across all simulated runs and all years.")
+    print("Final-year summaries aggregate across simulated runs in the final year only.\n")
+
+    for metric_key, model_dict in metrics.items():
+        print(metric_labels.get(metric_key, metric_key))
+        print(
+            f"{'Model':<24}"
+            f"{'overall mean':>15}"
+            f"{'overall std':>15}"
+            f"{'final mean':>15}"
+            f"{'final std':>15}"
+        )
+        print("-" * 84)
+
+        for model_name, arr in model_dict.items():
+            overall_mean, overall_std = metric_overall_summary(arr)
+            final_mean, final_std = final_year_summary(arr)
+
+            print(
+                f"{model_name:<24}"
+                f"{overall_mean:>15.6f}"
+                f"{overall_std:>15.6f}"
+                f"{final_mean:>15.6f}"
+                f"{final_std:>15.6f}"
+            )
+
+        print()
 
 
 def main() -> int:
@@ -925,6 +1171,70 @@ def main() -> int:
             ncols=3,
             title=f"Forecast cumulative adoptions through {forecast_year}: batch mean",
         )
+        
+        n_obs_years = data.Y.shape[0]
+
+        model_batches = {
+            "SSSB": batch["cum_hist"][:, :n_obs_years, :],
+            "Uniform Bass": batch_uniform["cum_hist"][:, :n_obs_years, :],
+            "Population Bass": batch_population["cum_hist"][:, :n_obs_years, :],
+        }
+        
+        spatial_metrics = compute_spatial_binary_metrics(
+            Y_obs=data.Y,
+            model_batches=model_batches,
+        )
+        
+        print_spatial_metric_table(spatial_metrics)
+        
+        metric_dir = out_dir / "metrics"
+        metric_dir.mkdir(parents=True, exist_ok=True)
+        
+        metric_plot_specs = [
+            (
+                "hamming_new",
+                "Hamming distance: yearly new adoptions",
+                "Hamming distance",
+                False,
+                "hamming_new_adoptions.png",
+            ),
+            (
+                "hamming_cum",
+                "Hamming distance: cumulative adoptions",
+                "Hamming distance",
+                False,
+                "hamming_cumulative_adoptions.png",
+            ),
+            (
+                "jaccard_new",
+                "Jaccard similarity: yearly new adoptions",
+                "Jaccard similarity",
+                True,
+                "jaccard_new_adoptions.png",
+            ),
+            (
+                "jaccard_cum",
+                "Jaccard similarity: cumulative adoptions",
+                "Jaccard similarity",
+                True,
+                "jaccard_cumulative_adoptions.png",
+            ),
+        ]
+        
+        for metric_key, title, ylabel, higher_is_better, fname in metric_plot_specs:
+            curves = {}
+            for model_name, arr in spatial_metrics[metric_key].items():
+                mean, std = metric_curve_summary(arr)
+                curves[model_name] = (mean, std)
+        
+            plot_metric_curves(
+                years=data.years,
+                curves=curves,
+                out_path=metric_dir / fname,
+                title=title,
+                ylabel=ylabel,
+                higher_is_better=higher_is_better,
+            )
 
     # Animations
     hist_years = data.years
