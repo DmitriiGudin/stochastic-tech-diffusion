@@ -39,3 +39,11 @@ In addition to the outputs on the screen, a few plots will be saved to *out/CA_N
 python run_simulations.py --model CA_NV_AZ_UT_config
 ```
 In addition to the data on the screen, a few plots and animations will appear in *out/simulations*.
+
+
+# Reproduction of the dissertation results
+All the results featured in the Ph.D. dissertation called "Modeling Spatial Technology Diffusion With Reaction-Diffusion Equations" by D. Gudin were obtained by running the Powershell script:
+```
+./run_Everything.ps1
+```
+The results are reproducible due to the fixed seed values in *configs.py*.
