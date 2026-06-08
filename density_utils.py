@@ -712,16 +712,60 @@ def plot_transmission_distance_nodes(
     triang = mtri.Triangulation(lon, lat, tri)
     ax.triplot(triang, linewidth=0.2, color="0.8", alpha=0.6)
 
-    sc = ax.scatter(
-        lon,
-        lat,
-        c=plot_vals,
-        s=max(6.0, 5000.0 / max(np.sqrt(len(vals)), 1.0)) * 0.35,
-        linewidths=0.0,
-        vmin=0.0,
-        vmax=vmax,
-    )
-
+    finite = np.isfinite(plot_vals)
+    s = max(6.0, 5000.0 / max(np.sqrt(len(vals)), 1.0)) * 0.35
+    
+    finite_vals = plot_vals[finite]
+    if finite_vals.size == 0:
+        layer_edges = np.array([0.0, vmax])
+    else:
+        qs = np.linspace(0.0, 1.0, 11)
+        layer_edges = np.nanquantile(finite_vals, qs)
+        layer_edges = np.unique(layer_edges)
+        if layer_edges.size < 2:
+            layer_edges = np.array([0.0, vmax])
+    
+    sc = None
+    
+    for ell in range(layer_edges.size - 1):
+        lo = layer_edges[ell]
+        hi = layer_edges[ell + 1]
+    
+        if ell == layer_edges.size - 2:
+            mask = finite & (plot_vals >= lo) & (plot_vals <= hi)
+        else:
+            mask = finite & (plot_vals >= lo) & (plot_vals < hi)
+    
+        idx = np.flatnonzero(mask)
+        if idx.size == 0:
+            continue
+    
+        idx = idx[np.argsort(plot_vals[idx])]
+    
+        sc = ax.scatter(
+            lon[idx],
+            lat[idx],
+            c=plot_vals[idx],
+            s=s,
+            linewidths=0.0,
+            vmin=0.0,
+            vmax=vmax,
+            alpha=0.55 + 0.45 * (ell + 1) / max(layer_edges.size - 1, 1),
+            zorder=2 + ell,
+        )
+    
+    if sc is None:
+        sc = ax.scatter(
+            lon,
+            lat,
+            c=np.zeros_like(plot_vals),
+            s=s,
+            linewidths=0.0,
+            vmin=0.0,
+            vmax=vmax,
+            alpha=0.55,
+            zorder=2,
+        )
     fig.colorbar(sc, ax=ax, fraction=0.045, pad=0.02, label="log1p distance to line [km]")
 
     ax.set_aspect("equal", adjustable="box")

@@ -755,6 +755,26 @@ def main() -> int:
 
     # Bass fit to monthly cumulative observed curve.
     bass = fit_bass_curve(t_obs_month, cum_obs_month)
+    
+    print("[CLASSIC BASS FIT]")
+    print("Uniform classic Bass model:")
+    print(f"  p = {bass['p']:.12g}")
+    print(f"  q = {bass['q']:.12g}")
+    print(f"  M = {bass['M']:.12g}")
+    print(f"  fit RMSE = {bass['rmse']:.12g}")
+    print(f"  optimizer success = {bass['success']}")
+    
+    print("Population-informed classic Bass model:")
+    print(f"  p = {bass['p']:.12g}")
+    print(f"  q = {bass['q']:.12g}")
+    print(f"  M = {bass['M']:.12g}")
+    print(f"  fit RMSE = {bass['rmse']:.12g}")
+    print(f"  optimizer success = {bass['success']}")
+    print(
+        "Note: both Bass baselines share the same aggregate Bass fit; "
+        "they differ only in spatial allocation."
+    )
+    
     cum_bass = bass_cumulative(t_obs_month, bass["p"], bass["q"], bass["M"])
     
     # Convert monthly Bass cumulative curve to annual increments.
@@ -1232,6 +1252,13 @@ def main() -> int:
         "observed_total_post_seed": float(annual_obs_eval.sum()),
         "model_expected_total_full_window_conditioned": float(annual_model_conditioned.sum()),
         "model_expected_total_post_seed": float(annual_model_eval.sum()),
+        "classic_bass_fit": {
+            "uniform": bass,
+            "population": bass,
+            "note": (
+                "Uniform and population-informed Bass baselines share the same aggregate Bass p, q, M; they differ only in spatial allocation."
+            ),
+        },
     }
 
     metrics_path = out_dir / "metrics.json"

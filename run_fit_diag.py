@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
-import numpy as np
 
 from fit_data_utils import build_sssb_fit_data
 from sssb_solver import SSSBFitParams, SSSBFitConfig, observed_driven_nll

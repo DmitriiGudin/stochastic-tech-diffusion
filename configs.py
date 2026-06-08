@@ -39,7 +39,7 @@ DEFAULT = {
         "dt_years": 0.05,
         "use_covariates": True,
         "fit_S0": False,
-        "n_random": 500,
+        "n_random": 5000,
         "maxiter": 500,
         "seed": 1337,
         "population_key": "population_smooth_2020",
@@ -91,9 +91,9 @@ DEFAULT = {
         "forecast_year": 2050,
         "seed": 1337,
         "fps": 2,
-        "n_single_runs": 5,
+        "n_single_runs": 10,
         "run_batch": True,
-        "batch_n_sims": 10,
+        "batch_n_sims": 100,
     },
 }
 
@@ -113,11 +113,66 @@ CONFIGS = {
         "fit": {
             "year_window": [2007, 2025],
             "seed_year": 2016,
-            "use_covariates": True,
-            "fit_S0": False,
-            "n_random": 1000, #10000
-            "maxiter": 500,
-            "dt_years": 0.05,
+        },
+    },
+    
+    "MD_DC_VA_DE_config": {
+        "region": {
+            "states": ["MD", "DC", "VA", "DE"],
+            "counties": [],
+        },
+        "mesh": {
+            "h_km": 2,
+            "simplify_km": 6,
+        },
+        "fit": {
+            "year_window": [2011, 2025],
+            "seed_year": 2018,
+        },
+    },
+    
+    "IN_OH_IL_MI_WI_MO_MN_IA_config": {
+        "region": {
+            "states": ['IN', 'OH', 'IL', 'MI', 'WI', 'MO', 'MN', 'IA'],
+            "counties": [],
+        },
+        "mesh": {
+            "h_km": 7,
+            "simplify_km": 21,
+        },
+        "fit": {
+            "year_window": [2011, 2025],
+            "seed_year": 2018,
+        },
+    },
+    
+    "TX_config": {
+        "region": {
+            "states": ['TX'],
+            "counties": [],
+        },
+        "mesh": {
+            "h_km": 5,
+            "simplify_km": 15,
+        },
+        "fit": {
+            "year_window": [2015, 2025],
+            "seed_year": 2020,
+        },
+    },
+    
+    "FL_GA_SC_NC_config": {
+        "region": {
+            "states": ['FL', 'GA', 'SC', 'NC'],
+            "counties": [],
+        },
+        "mesh": {
+            "h_km": 5,
+            "simplify_km": 15,
+        },
+        "fit": {
+            "year_window": [2011, 2025],
+            "seed_year": 2018,
         },
     },
 }

@@ -540,7 +540,7 @@ def draw_node_map(
         lat[idx],
         c=vals[idx],
         s=s,
-        cmap="hot",
+        cmap="nipy_spectral",
         vmin=vmin,
         vmax=vmax,
         linewidths=0.0,
@@ -825,6 +825,9 @@ def plot_metric_curves(
     ax.set_title(title)
     ax.grid(True, alpha=0.3)
     ax.legend()
+    
+    # All these metrics are nonnegative. Keeping ymin=0 makes magnitudes clear.
+    ax.set_ylim(bottom=0.0)
 
     direction = "Higher is better" if higher_is_better else "Lower is better"
     ax.text(
@@ -1330,12 +1333,22 @@ def main() -> int:
         
         for metric_key, title, ylabel, higher_is_better, fname in metric_plot_specs:
             curves = {}
-            for model_name, arr in spatial_metrics_full[metric_key].items():
+        
+            if metric_key in ("hamming_new", "jaccard_new"):
+                # For yearly-new metrics, plot only post-seed years.
+                metrics_for_plot = spatial_metrics_eval_new
+                years_for_plot = data.years[eval_start:n_obs_years]
+            else:
+                # For cumulative metrics, plot the full seed-conditioned window.
+                metrics_for_plot = spatial_metrics_full
+                years_for_plot = data.years
+        
+            for model_name, arr in metrics_for_plot[metric_key].items():
                 mean, std = metric_curve_summary(arr)
                 curves[model_name] = (mean, std)
         
             plot_metric_curves(
-                years=data.years,
+                years=years_for_plot,
                 curves=curves,
                 out_path=metric_dir / fname,
                 title=title,
