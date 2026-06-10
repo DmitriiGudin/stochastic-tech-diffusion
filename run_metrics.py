@@ -979,6 +979,9 @@ def main() -> int:
     fig.savefig(fig_path_log, dpi=200)
     plt.close(fig)
     
+    field_plot_q = float(cfg_named["density"].get("field_plot_quantile", 1.0))
+    field_plot_q = min(max(field_plot_q, 0.0), 1.0)
+    
     field_values = {
         "U": details["cum_mu_U"],
         "V": details["cum_mu_V"],
@@ -986,16 +989,32 @@ def main() -> int:
         "J": details["final_J"],
     }
     
+    print("[FIELD PLOT]")
+    print(f"  field_plot_quantile = {field_plot_q}")
+    
     fig, axes = plt.subplots(2, 2, figsize=(13, 10), constrained_layout=True)
     axes = axes.ravel()
     
     for ax, (name, vals) in zip(axes, field_values.items()):
+        vals = np.asarray(vals, dtype=float)
         log_vals = np.log1p(np.clip(vals, 0.0, None))
+        finite_log_vals = log_vals[np.isfinite(log_vals)]
     
         vmin_i = 0.0
-        vmax_i = float(np.nanquantile(log_vals, 0.99))
+    
+        if finite_log_vals.size == 0:
+            vmax_i = 1.0
+        else:
+            vmax_i = float(np.nanquantile(finite_log_vals, field_plot_q))
+    
         if vmax_i <= vmin_i:
             vmax_i = 1.0
+    
+        print(
+            f"  {name}: "
+            f"raw max={float(np.nanmax(vals)):.6g}, "
+            f"log1p vmax used={vmax_i:.6g}"
+        )
     
         sc = plot_node_values(
             ax,

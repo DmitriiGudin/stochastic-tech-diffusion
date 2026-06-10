@@ -32,6 +32,7 @@ DEFAULT = {
         "adoption_plot_scale": "log1p",  # "linear", "log1p" or "mixed"
         "mixed_log_range": 8.0,
         "adoption_plot_quantile": 1.0,  # use 1.0 for true max; 0.99 for clipped scale
+        "field_plot_quantile": 1.0,  # use 1.0 for true max; 0.99 for clipped scale
         "adoption_shared_colorbar": True,
     },
 
